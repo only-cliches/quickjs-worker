@@ -1,0 +1,23 @@
+[package]
+name = "quickjs-worker"
+version = "0.1.0"
+description = "Run a QuickJS worker from NodeJS"
+authors = ["me@scottlott.com"]
+license = "MIT"
+edition = "2021"
+exclude = ["index.node"]
+
+[lib]
+crate-type = ["cdylib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+lazy_static = "1.4.0"
+neon = "1"
+quickjs_runtime = { version = "0.13.3", features = [] }
+tokio = { version = "1.37.0", features = ["full"] }
+log = "0.4"
+env_logger = "0.9"
+serde_json = "1.0.116"
+cpu-time = "1.0.0"
