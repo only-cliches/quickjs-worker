@@ -2,11 +2,14 @@ const q = require(".");
 
 let counter = 0;
 const quick = q.QuickJSWorker({
-    // console: console,
+    console: console,
     maxEvalMs: 1500,
     maxMemoryBytes: 256 * 1000 * 1000,
     maxStackSizeBytes: 10 * 1000 * 1000,
     maxInterrupt: 10000,
+    globals: {
+        addTwo: ([a, b]) => a + b
+    }
     // imports: (moduleName) => {
     //     console.log('IMPORTS', moduleName);
     //     return "export default ({})";
@@ -23,7 +26,7 @@ const quick = q.QuickJSWorker({
 const quick2 = q.QuickJSWorker({maxInterrupt: 1000});
 
 quick.on("message", (msg) => {
-    console.log("QUICKJS MSG", typeof msg, msg);
+    console.log("QUICKJS MSG", typeof msg, msg, msg instanceof Date);
 });
 
 
@@ -32,9 +35,15 @@ quick.on("message", (msg) => {
     let byteCode = await quick.getByteCode(`const test = (a, b) => Promise.resolve(a+b)`);
     await quick2.loadByteCode(byteCode);
 
-    console.log(await quick2.eval(`new Promise((res, rej) => {
-        setTimeout(() => res(200), 500);
-    })`));
+    console.log("A", await quick.eval(`test(1, 2)`));
+    // console.log(await quick.eval(`
+    //     typeof require
+    // `));
+    // console.log(date, date instanceof Date);
+
+    // console.log(await quick2.eval(`new Promise((res, rej) => {
+    //     setTimeout(() => res(200), 500);
+    // })`));
 
     // console.log(await quick.eval(`
     //     new Promise((res, rej) => {
@@ -46,27 +55,27 @@ quick.on("message", (msg) => {
     //     })
     // `));
 
-    try {
-        const d = new Date();
-        await quick.eval("on('message', (msg) => { console.log([typeof msg, msg]) })");
-        // await quick.eval(`postMessage(Object.properties(new Date()))`);
-        // await quick.eval("console.log('hello')");
-        // quick.postMessage("STRING BUDDY");
+    // try {
+    //     const d = new Date();
+    //     await quick.eval("on('message', (msg) => { console.log([typeof msg, msg]) })");
+    //     // await quick.eval(`postMessage(Object.properties(new Date()))`);
+    //     // await quick.eval("console.log('hello')");
+    //     // quick.postMessage("STRING BUDDY");
         
-        console.log(await quick.eval(`
-            new Promise((res) => {
-                let count = 0;
-                const loop = () => {
-                    console.log(count++);
-                    setTimeout(loop, 500);
-                }
-                loop();
-            })
-        `));
+    //     console.log(await quick.eval(`
+    //         new Promise((res) => {
+    //             let count = 0;
+    //             const loop = () => {
+    //                 console.log(count++);
+    //                 setTimeout(loop, 500);
+    //             }
+    //             loop();
+    //         })
+    //     `));
         
-    } catch (e) {
-        console.log("ERROR", e);
-    }
+    // } catch (e) {
+    //     console.log("ERROR", e);
+    // }
 
     // await quick.eval(`
     //     import * as t from "test";

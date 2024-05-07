@@ -1,8 +1,11 @@
 
 export type EvalStats = {
     interrupts: number,
-    evalTimeMs: number
+    evalTimeMs: number,
+    cpuTimeMs: number
 }
+
+export type Primitive = string | number | boolean;
 
 /**
  * Create a new QuickJS runtime in it's own thread
@@ -10,7 +13,10 @@ export type EvalStats = {
 export const QuickJSWorker: (args?: {
     /** Capture console commands from the runtime */
     console?: {
-        log: (value: any) => any
+        log: (value: any) => any,
+        warn: (value: any) => any,
+        info: (value: any) => any,
+        error: (value: any) => any,
     },
     /** Set the maxmimum milliseconds each call to .eval() is allowed to take. */
     maxEvalMs?: number,
@@ -19,7 +25,7 @@ export const QuickJSWorker: (args?: {
     /** Set the maxmimum stack size bytes the runtime is allowed to use for memory */
     maxStackSizeBytes?: number,
     /**
-     * When .eval() is called, an interrupt handler will be ran internally to see if execution should continue.
+     * When .eval() is called, an interrupt handler is ran internally from time to time to see if execution should continue.
      * Once the number of interrupt calls reaches the threshold provided here, the .eval() call will be terminated.
      * Prevents while(true) loops, more interrupts allow more code exection.
      */
@@ -27,7 +33,10 @@ export const QuickJSWorker: (args?: {
     /** How many allocations can the runtime do before the GC runs? */
     gcThresholdAlloc?: number,
     /** Automatically run the GC at regular intervals */
-    gcIntervalMs?: number
+    gcIntervalMs?: number,
+    globals?: {
+        [key: string]: Primitive | Date | Array<Primitive> | {[key: string]: Primitive} | ((arg: any) => any)
+    }
     // imports: (moduleName) => {
     //     console.log('IMPORTS', moduleName);
     //     return "export default ({})";
@@ -44,7 +53,7 @@ export const QuickJSWorker: (args?: {
      * */
     eval: <T>(jsSourceCode: string) => Promise<[T, EvalStats]>
     /** Handle postMessage() events from the virtual machine */
-    on: (type: "message", callback: (event: any) => void) => void
+    on: (type: "message" | "close", callback: (event: any) => void) => void
     /** Convert a block of source code into QuickJS ByteCode */
     getByteCode: (jsSourceCode: string) => Promise<Uint8Array>
     /** Load QuickJS ByteCode into the runtime */

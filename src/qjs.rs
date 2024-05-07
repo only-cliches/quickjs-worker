@@ -1,5 +1,5 @@
-use neon::prelude::*;
-use neon::types::{Deferred, JsDate};
+use neon::{prelude::*};
+use neon::types::Deferred;
 use quickjs_runtime::builder::QuickJsRuntimeBuilder;
 use quickjs_runtime::facades::QuickJsRuntimeFacade;
 use quickjs_runtime::jsutils::Script;
@@ -7,15 +7,65 @@ use quickjs_runtime::quickjsrealmadapter::QuickJsRealmAdapter;
 use quickjs_runtime::quickjsruntimeadapter::QuickJsRuntimeAdapter;
 use quickjs_runtime::quickjsvalueadapter::QuickJsValueAdapter;
 use quickjs_runtime::values::{JsValueConvertable, JsValueFacade};
+
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Instant};
 use tokio::runtime::Runtime;
 
 use crate::{
-    ChannelMsg, MessageTypes, QuickJSOptions, INT_COUNTERS, NODE_CALLBACKS, NODE_CHANNELS,
-    QUICKJS_CALLBACKS, QUICKJS_SENDERS,
+    JsDataTypes, NodeCallbackTypes, QuickChannelMsg, QuickJSOptions, SyncChannelMsg, INT_COUNTERS, NODE_CALLBACKS, NODE_CHANNELS, QUICKJS_CALLBACKS, SYNC_SENDERS
 };
+
+macro_rules! quick_js_console {
+    ($key:tt, $func_name:ident) => {
+        fn $func_name(
+            _rt: &QuickJsRuntimeAdapter,
+            realm: &QuickJsRealmAdapter,
+            _: &QuickJsValueAdapter,
+            args: &[QuickJsValueAdapter],
+        ) -> Result<QuickJsValueAdapter, quickjs_runtime::jsutils::JsError> {
+            let unlockedChannels = NODE_CHANNELS.blocking_lock();
+            let channelID = realm
+                .get_object_property(&realm.get_global().unwrap(), "__CHANNELID")?
+                .to_i32() as usize;
+
+            {
+                let intCounters = &mut INT_COUNTERS.blocking_lock();
+                let thisCounter = &mut intCounters[channelID];
+                thisCounter.1 += 1;
+                if thisCounter.0 > 0 && thisCounter.1 > thisCounter.0 {
+                    return realm.create_error("InternalError", "interrupted", "");
+                }
+            }
+
+            let channel = unlockedChannels[channelID].clone();
+
+            let jsType = JsDataTypes::from_quick_value(&args[0], realm).unwrap();
+
+            if let Some(channel) = channel {
+                channel.send(move |mut cx| {
+                    let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
+                    let callbacks = &unlockedCallbacks[channelID];
+                    if let Some(callback) =
+                        &QuickJSWorker::get_console_by_key($key, callbacks)
+                    {
+                        let nodeType = jsType.to_node_value(&mut cx)?;
+                        let callbackInner = callback.to_inner(&mut cx);
+                        callbackInner
+                            .call_with(&mut cx)
+                            .arg(nodeType)
+                            .apply::<JsValue, _>(&mut cx)?;
+                    }
+    
+                    Ok(())
+                });
+            }
+
+            Ok(realm.create_undefined().unwrap())
+        }
+    };
+}
 
 struct CustomModuleLoader {}
 
@@ -95,13 +145,16 @@ pub fn build_runtime(
     opts: &QuickJSOptions,
     channelId: usize,
 ) -> Arc<tokio::sync::Mutex<QuickJsRuntimeFacade>> {
-    let mut rtbuilder = QuickJsRuntimeBuilder::new().script_module_loader(CustomModuleLoader {});
+
+    let mut rtbuilder = QuickJsRuntimeBuilder::new();
+
+    //rtbuilder = rtbuilder.script_module_loader(CustomModuleLoader {});
 
     if let Some(int) = opts.maxInt {
         let mut intCounters = INT_COUNTERS.blocking_lock();
         intCounters[channelId].0 = int as i64;
         if intCounters[channelId].0 > 0 {
-            rtbuilder = rtbuilder.set_interrupt_handler(move |rt| {
+            rtbuilder = rtbuilder.set_interrupt_handler(move |_rt| {
                 let mut intCounters = INT_COUNTERS.blocking_lock();
                 intCounters[channelId].1 += 1;
                 return intCounters[channelId].1 > intCounters[channelId].0;
@@ -125,7 +178,7 @@ pub fn build_runtime(
     return Arc::new(tokio::sync::Mutex::new(rtbuilder.build()));
 }
 
-struct QuickJSWorker {}
+pub struct QuickJSWorker {}
 
 impl QuickJSWorker {
     pub fn vec_u8_to_NodeArray<'a, C: Context<'a>>(
@@ -143,29 +196,21 @@ impl QuickJSWorker {
     }
 
     pub async fn process_script_eval(
-        cpuTime: cpu_time::ProcessTime,
-        startTime: Instant,
-        maxEvalTime: Option<u64>,
-        channelId: usize,
+        cpu_time: cpu_time::ProcessTime,
+        start_time: Instant,
+        max_eval_time: Option<u64>,
+        channel_id: usize,
         script_result: std::result::Result<JsValueFacade, quickjs_runtime::jsutils::JsError>,
         def: Deferred,
-        rtClone: Arc<tokio::sync::Mutex<QuickJsRuntimeFacade>>,
+        rt_clone: Arc<tokio::sync::Mutex<QuickJsRuntimeFacade>>,
     ) {
-        let mut maxTimeMs = maxEvalTime.unwrap_or(0);
+        let mut maxTimeMs = max_eval_time.unwrap_or(0);
 
         if let Err(err) = script_result {
-            let unlocked = NODE_CHANNELS.lock().await;
-            let channel = unlocked[channelId].clone();
-            if let Some(channel) = channel {
-                channel
-                    .send(move |mut cx| {
-                        let msg = cx.string(err.to_string());
-                        def.reject(&mut cx, msg);
-                        Ok(())
-                    })
-                    .join()
-                    .unwrap();
-            }
+
+            let syncChannel = SYNC_SENDERS.lock().await;
+            syncChannel[channel_id].send(SyncChannelMsg::SendError { e: err.to_string(), def }).await.unwrap();
+            return;
         } else if let Ok(mut script_result) = script_result {
             let mut promiseErr = (None, None, false);
 
@@ -175,9 +220,9 @@ impl QuickJSWorker {
                         JsValueFacade::JsPromise { ref cached_promise } => {
                             let promiseFuture = cached_promise.get_promise_result();
 
-                            if let Some(_) = maxEvalTime {
+                            if let Some(_) = max_eval_time {
                                 maxTimeMs = maxTimeMs
-                                    .saturating_sub(startTime.elapsed().as_millis() as u64);
+                                    .saturating_sub(start_time.elapsed().as_millis() as u64);
 
                                 match tokio::time::timeout(
                                     std::time::Duration::from_millis(maxTimeMs),
@@ -203,18 +248,8 @@ impl QuickJSWorker {
                                         }
                                     },
                                     Err(timeoutReached) => {
-                                        let unlocked = NODE_CHANNELS.lock().await;
-                                        let channel = unlocked[channelId].clone();
-                                        if let Some(channel) = channel {
-                                            channel
-                                                .send(move |mut cx| {
-                                                    let msg = cx.string("Timeout");
-                                                    def.reject(&mut cx, msg);
-                                                    Ok(())
-                                                })
-                                                .join()
-                                                .unwrap();
-                                        }
+                                        let syncChannel = SYNC_SENDERS.lock().await;
+                                        syncChannel[channel_id].send(SyncChannelMsg::SendError { e: timeoutReached.to_string(), def }).await.unwrap();
                                         return;
                                     }
                                 }
@@ -243,185 +278,32 @@ impl QuickJSWorker {
                 }
             }
 
-            if promiseErr.2 == true {
-                let unlocked = NODE_CHANNELS.lock().await;
-                let channel = unlocked[channelId].clone();
+            let syncChannel = SYNC_SENDERS.lock().await;
 
-                if let Some(channel) = channel {
-                    channel
-                        .send(move |mut cx| {
-                            if let Some(e) = promiseErr.1 {
-                                // TODO: resolve type and pass, do not stringify
-                                let msg = cx.string(e.stringify());
-                                def.reject(&mut cx, msg);
-                            } else if let Some(e) = promiseErr.0 {
-                                let msg = cx.string(e.to_string());
-                                def.reject(&mut cx, msg);
-                            }
-                            Ok(())
-                        })
-                        .join()
-                        .unwrap();
+            if promiseErr.2 == true {
+                
+                if let Some(e) = promiseErr.1 {
+                    // TODO: resolve type and pass, do not stringify
+                    syncChannel[channel_id].send(SyncChannelMsg::SendError { e: e.stringify(), def }).await.unwrap();
+                } else if let Some(e) = promiseErr.0 {
+                    syncChannel[channel_id].send(SyncChannelMsg::SendError { e: e.to_string(), def }).await.unwrap();
                 }
+
                 return;
             }
 
-            // stringify JSON and Arrays
-            let (script_result, maybeByteCode, stringified) =
-                if script_result.is_js_array() || script_result.is_js_object() {
-                    rtClone
-                        .lock()
-                        .await
-                        .loop_async(move |runtime| {
-                            let realm = runtime.get_main_realm();
-                            let adapter = realm.from_js_value_facade(script_result).unwrap();
-                            let string = realm.json_stringify(&adapter, None).unwrap();
-                            return (
-                                realm.to_js_value_facade(&adapter).unwrap(),
-                                Some(realm.to_js_value_facade(&adapter).unwrap()),
-                                Some(string),
-                            );
-                        })
-                        .await
-                } else {
-                    rtClone
-                        .lock()
-                        .await
-                        .loop_async(move |runtime| {
-                            let realm = runtime.get_main_realm();
-                            let adapter = realm.from_js_value_facade(script_result).unwrap();
-                            return (
-                                realm.to_js_value_facade(&adapter).unwrap(),
-                                Some(realm.to_js_value_facade(&adapter).unwrap()),
-                                None,
-                            );
-                        })
-                        .await
-                };
+            let jsDataType = rt_clone.lock().await.loop_async(|rt| {
+                let realm = rt.get_main_realm();
+                return JsDataTypes::from_quick_value(&realm.from_js_value_facade(script_result).unwrap(), realm).unwrap();
+            }).await;
 
-            // extract timestamp from Date Object
-            // doesn't work right now....
-            // let (script_result, dateTime) = if script_result.get_value_type() == quickjs_runtime::jsutils::JsValueType::Date {
+            syncChannel[channel_id].send(SyncChannelMsg::RespondEval { result: jsDataType, def, cpu_time, start_time }).await.unwrap();
 
-            //     rt.loop_realm(None, move |runtime, realm| {
-            //         let adapter = realm.from_js_value_facade(script_result).unwrap();
-            //         let getTime = realm.get_object_property(&adapter, "getTime").unwrap();
-            //         let time = realm.invoke_function(None, &getTime, &[]).unwrap();
-            //         return (realm.to_js_value_facade(&adapter).unwrap(), Some(time.to_f64()));
-            //     }).await
-            // } else { (script_result, None) };
-
-            let unlocked = NODE_CHANNELS.lock().await;
-            let channel = unlocked[channelId].clone();
-
-            let totalCPU = cpuTime.elapsed().as_nanos();
-
-            if let Some(channel) = channel {
-                channel.send(move |mut cx| {
-                    let returnValue = cx.empty_array();
-                    let stats = cx.empty_object();
-                    let intCounters = INT_COUNTERS.blocking_lock();
-
-                    let interruptCount = if intCounters[channelId].0 > 0 {
-                        cx.number(intCounters[channelId].1 as f64)
-                    } else {
-                        cx.number(-1)
-                    };
-                    let evalTime =
-                        cx.number(startTime.elapsed().as_nanos() as f64 / (1000f64 * 1000f64));
-                    let totalCPU = cx.number(totalCPU as f64 / (1000f64 * 1000f64));
-                    stats.set(&mut cx, "interrupts", interruptCount)?;
-                    stats.set(&mut cx, "evalTimeMs", evalTime)?;
-                    stats.set(&mut cx, "cpuTimeMs", totalCPU)?;
-                    returnValue.set(&mut cx, 1, stats)?;
-
-                    match script_result.get_value_type() {
-                        quickjs_runtime::jsutils::JsValueType::I32 => {
-                            let msg = cx.number(script_result.get_i32() as f64);
-                            returnValue.set(&mut cx, 0, msg)?;
-                            def.resolve(&mut cx, returnValue);
-                        }
-                        quickjs_runtime::jsutils::JsValueType::F64 => {
-                            let msg = cx.number(script_result.get_f64());
-                            returnValue.set(&mut cx, 0, msg)?;
-                            def.resolve(&mut cx, returnValue);
-                        }
-                        quickjs_runtime::jsutils::JsValueType::String => {
-                            let msg = cx.string(script_result.get_str());
-                            returnValue.set(&mut cx, 0, msg)?;
-                            def.resolve(&mut cx, returnValue);
-                        }
-                        quickjs_runtime::jsutils::JsValueType::Boolean => {
-                            let msg = cx.boolean(script_result.get_bool());
-                            returnValue.set(&mut cx, 0, msg)?;
-                            def.resolve(&mut cx, returnValue);
-                        }
-                        quickjs_runtime::jsutils::JsValueType::Array => {
-                            if let Some(json) = stringified {
-                                let jsonParse = cx
-                                    .global::<JsObject>("JSON")?
-                                    .get_value(&mut cx, "parse")?
-                                    .downcast::<JsFunction, _>(&mut cx)
-                                    .unwrap();
-                                let msg = jsonParse
-                                    .call_with(&mut cx)
-                                    .arg(cx.string(json))
-                                    .apply::<JsValue, _>(&mut cx)?;
-                                returnValue.set(&mut cx, 0, msg)?;
-                                def.resolve(&mut cx, returnValue);
-                            }
-                        }
-                        quickjs_runtime::jsutils::JsValueType::Object => {
-                            if let Some(json) = stringified {
-                                let jsonParse = cx
-                                    .global::<JsObject>("JSON")?
-                                    .get_value(&mut cx, "parse")?
-                                    .downcast::<JsFunction, _>(&mut cx)
-                                    .unwrap();
-                                let msg = jsonParse
-                                    .call_with(&mut cx)
-                                    .arg(cx.string(json))
-                                    .apply::<JsValue, _>(&mut cx)?;
-                                returnValue.set(&mut cx, 0, msg)?;
-                                def.resolve(&mut cx, returnValue);
-                            }
-                        }
-                        // this doesn't work, calls the "object" path every time for some reason
-                        // quickjs_runtime::jsutils::JsValueType::Date => {
-
-                        //     if let Some(timestamp) = dateTime {
-                        //         let msg = cx.date(timestamp).unwrap();
-                        //         def.resolve(&mut cx, msg);
-                        //     }
-                        // },
-                        quickjs_runtime::jsutils::JsValueType::Null => {
-                            let msg = cx.null();
-                            returnValue.set(&mut cx, 0, msg)?;
-                            def.resolve(&mut cx, returnValue);
-                        }
-                        quickjs_runtime::jsutils::JsValueType::Undefined => {
-                            let msg = cx.undefined();
-                            returnValue.set(&mut cx, 0, msg)?;
-                            def.resolve(&mut cx, returnValue);
-                        }
-                        _ => {
-                            let msg = cx.string(script_result.stringify());
-                            returnValue.set(&mut cx, 0, msg)?;
-                            def.resolve(&mut cx, returnValue);
-                        } // quickjs_runtime::jsutils::JsValueType::Function => todo!(),
-                          // quickjs_runtime::jsutils::JsValueType::BigInt => todo!(),
-                          // quickjs_runtime::jsutils::JsValueType::Promise => todo!(),
-                          // quickjs_runtime::jsutils::JsValueType::Error => todo!(),
-                    }
-
-                    Ok(())
-                });
-            }
         }
     }
 
     pub fn event_listener(
-        rt: &QuickJsRuntimeAdapter,
+        _rt: &QuickJsRuntimeAdapter,
         realm: &QuickJsRealmAdapter,
         _: &QuickJsValueAdapter,
         args: &[QuickJsValueAdapter],
@@ -454,12 +336,11 @@ impl QuickJSWorker {
     }
 
     pub fn post_message(
-        rt: &QuickJsRuntimeAdapter,
+        _rt: &QuickJsRuntimeAdapter,
         realm: &QuickJsRealmAdapter,
         _: &QuickJsValueAdapter,
         args: &[QuickJsValueAdapter],
     ) -> Result<QuickJsValueAdapter, quickjs_runtime::jsutils::JsError> {
-        let realm = rt.get_main_realm();
 
         let channelID = realm
             .get_object_property(&realm.get_global().unwrap(), "__CHANNELID")?
@@ -475,307 +356,241 @@ impl QuickJSWorker {
             }
         }
 
-        let unlocked = QUICKJS_SENDERS.blocking_lock();
-        let tx = unlocked[channelID].clone();
+        let unlocked = SYNC_SENDERS.blocking_lock();
+        let tx = &unlocked[channelID];
 
-        match args[0].get_js_type() {
-            quickjs_runtime::jsutils::JsValueType::I32 => {
-                let msg = args[0].to_i32() as f64;
-                tx.blocking_send(ChannelMsg::SendMessageToNode {
-                    message: MessageTypes::Number { msg },
-                })
-                .unwrap();
-            }
-            quickjs_runtime::jsutils::JsValueType::F64 => {
-                let msg = args[0].to_f64();
-                tx.blocking_send(ChannelMsg::SendMessageToNode {
-                    message: MessageTypes::Number { msg },
-                })
-                .unwrap();
-            }
-            quickjs_runtime::jsutils::JsValueType::String => {
-                let msg = args[0].to_string().unwrap();
-                tx.blocking_send(ChannelMsg::SendMessageToNode {
-                    message: MessageTypes::String { msg },
-                })
-                .unwrap();
-            }
-            quickjs_runtime::jsutils::JsValueType::Boolean => {
-                let msg = args[0].to_bool();
-                tx.blocking_send(ChannelMsg::SendMessageToNode {
-                    message: MessageTypes::Boolean { msg },
-                })
-                .unwrap();
-            }
-            quickjs_runtime::jsutils::JsValueType::Object => {
-                let msg = realm.json_stringify(&args[0], None)?;
-                tx.blocking_send(ChannelMsg::SendMessageToNode {
-                    message: MessageTypes::Json { msg },
-                })
-                .unwrap();
-            }
-            quickjs_runtime::jsutils::JsValueType::Array => {
-                let msg = realm.json_stringify(&args[0], None)?;
-                tx.blocking_send(ChannelMsg::SendMessageToNode {
-                    message: MessageTypes::Array { msg },
-                })
-                .unwrap();
-            }
-            quickjs_runtime::jsutils::JsValueType::Date => {
-                let getTime = realm.get_object_property(&args[0], "getTime")?;
-                let time = realm.invoke_function(None, &getTime, &[])?;
-                let msg = time.to_f64();
-                tx.blocking_send(ChannelMsg::SendMessageToNode {
-                    message: MessageTypes::Date { msg },
-                })
-                .unwrap();
-            }
-            _ => {
-                return realm.create_error("Unsupported Message Type", "", "");
-            } // quickjs_runtime::jsutils::JsValueType::Function => todo!(),
-              // quickjs_runtime::jsutils::JsValueType::BigInt => todo!(),
-              // quickjs_runtime::jsutils::JsValueType::Promise => todo!(),
-              //
-              // quickjs_runtime::jsutils::JsValueType::Null => todo!(),
-              // quickjs_runtime::jsutils::JsValueType::Undefined => todo!(),
-              // quickjs_runtime::jsutils::JsValueType::Error => todo!(),
-        }
+        let msg = JsDataTypes::from_quick_value(&args[0], realm)?;
+
+        tx.blocking_send(SyncChannelMsg::SendMessageToNode {
+            message: msg,
+        })
+        .unwrap();
 
         Ok(realm.create_undefined().unwrap())
     }
 
-    pub fn console_log(
-        rt: &QuickJsRuntimeAdapter,
-        realm: &QuickJsRealmAdapter,
-        _: &QuickJsValueAdapter,
-        args: &[QuickJsValueAdapter],
-    ) -> Result<QuickJsValueAdapter, quickjs_runtime::jsutils::JsError> {
-        let realm = rt.get_main_realm();
-
-        let unlockedChannels = NODE_CHANNELS.blocking_lock();
-        let channelID = realm
-            .get_object_property(&realm.get_global().unwrap(), "__CHANNELID")?
-            .to_i32() as usize;
-
-        {
-            let intCounters = &mut INT_COUNTERS.blocking_lock();
-            let thisCounter = &mut intCounters[channelID];
-            thisCounter.1 += 1;
-            if thisCounter.0 > 0 && thisCounter.1 > thisCounter.0 {
-                return realm.create_error("InternalError", "interrupted", "");
-            }
+    pub fn get_console_by_key<'a>(
+        key: &str,
+        callbacks: &'a crate::NodeCallbacks,
+    ) -> &'a Option<Root<JsFunction>> {
+        match key {
+            "log" => &callbacks.console.log,
+            "warn" => &callbacks.console.warn,
+            "info" => &callbacks.console.info,
+            "error" => &callbacks.console.error,
+            _ => &None,
         }
-
-        let channel = unlockedChannels[channelID].clone();
-
-        if let Some(channel) = channel {
-            match args[0].get_js_type() {
-                quickjs_runtime::jsutils::JsValueType::I32 => {
-                    let data = args[0].to_i32() as f64;
-                    channel.send(move |mut cx| {
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(cx.number(data))
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                quickjs_runtime::jsutils::JsValueType::F64 => {
-                    let data = args[0].to_f64();
-                    channel.send(move |mut cx| {
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(cx.number(data))
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                quickjs_runtime::jsutils::JsValueType::String => {
-                    let data = args[0].to_string().unwrap();
-                    channel.send(move |mut cx| {
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(cx.string(data))
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                quickjs_runtime::jsutils::JsValueType::Boolean => {
-                    let data = args[0].to_bool();
-                    channel.send(move |mut cx| {
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(cx.boolean(data))
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                quickjs_runtime::jsutils::JsValueType::Object => {
-                    let data = realm.json_stringify(&args[0], None).unwrap();
-                    channel.send(move |mut cx| {
-                        let jsonParse = cx
-                            .global::<JsObject>("JSON")?
-                            .get_value(&mut cx, "parse")?
-                            .downcast::<JsFunction, _>(&mut cx)
-                            .unwrap();
-                        let out = jsonParse
-                            .call_with(&mut cx)
-                            .arg(cx.string(data))
-                            .apply::<JsObject, _>(&mut cx)?;
-
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(out)
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                quickjs_runtime::jsutils::JsValueType::Array => {
-                    let data = realm.json_stringify(&args[0], None).unwrap();
-                    channel.send(move |mut cx| {
-                        let jsonParse = cx
-                            .global::<JsObject>("JSON")?
-                            .get_value(&mut cx, "parse")?
-                            .downcast::<JsFunction, _>(&mut cx)
-                            .unwrap();
-                        let out = jsonParse
-                            .call_with(&mut cx)
-                            .arg(cx.string(data))
-                            .apply::<JsArray, _>(&mut cx)?;
-
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(out)
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                quickjs_runtime::jsutils::JsValueType::Null => {
-                    channel.send(move |mut cx| {
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(cx.null())
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                quickjs_runtime::jsutils::JsValueType::Undefined => {
-                    channel.send(move |mut cx| {
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(cx.undefined())
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                quickjs_runtime::jsutils::JsValueType::Date => {
-                    let getTime = realm.get_object_property(&args[0], "getTime")?;
-                    let time = realm.invoke_function(None, &getTime, &[])?;
-                    let msg = time.to_f64();
-                    channel.send(move |mut cx| {
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(cx.date(msg).unwrap())
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                }
-                _ => {
-                    let data = if let Ok(value) = args[0].to_string() {
-                        value
-                    } else {
-                        String::from("Unsupported type")
-                    };
-
-                    channel.send(move |mut cx| {
-                        let unlockedCallbacks = NODE_CALLBACKS.blocking_lock();
-                        let callbacks = &unlockedCallbacks[channelID];
-                        if let Some(callback) = &callbacks.console.log {
-                            let callbackInner = callback.to_inner(&mut cx);
-                            callbackInner
-                                .call_with(&mut cx)
-                                .arg(cx.string(data))
-                                .apply::<JsValue, _>(&mut cx)?;
-                        }
-
-                        Ok(())
-                    });
-                } // quickjs_runtime::jsutils::JsValueType::Function => todo!(),
-                  // quickjs_runtime::jsutils::JsValueType::BigInt => todo!(),
-                  // quickjs_runtime::jsutils::JsValueType::Promise => todo!(),
-                  // quickjs_runtime::jsutils::JsValueType::Error => todo!(),
-            }
-        }
-
-        Ok(realm.create_undefined().unwrap())
     }
 }
 
 pub fn quickjs_thread(
     opts: QuickJSOptions,
     channelId: usize,
-    mut urx: tokio::sync::mpsc::Receiver<ChannelMsg>,
+    mut urx: tokio::sync::mpsc::Receiver<QuickChannelMsg>,
+    mut urx2: tokio::sync::mpsc::Receiver<crate::SyncChannelMsg>
 ) {
     let rt = build_runtime(&opts, channelId);
 
-    let nodeMsgCallbacks: Arc<tokio::sync::Mutex<Vec<Root<JsFunction>>>> =
+    let nodeMsgCallbacks: Arc<tokio::sync::Mutex<Vec<(Root<JsFunction>, NodeCallbackTypes)>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-    // QuickJS Runtime Thread
+    let nodeClone = nodeMsgCallbacks.clone();
+
+    // blocking actions thread
+    thread::spawn(move || {
+
+        let msgCBClone = nodeClone.clone();
+
+        loop {
+
+            if let Some(msg) = urx2.blocking_recv() {
+                match msg {
+                    SyncChannelMsg::RespondEval { def, result, start_time, cpu_time } => {
+                        let unlocked = NODE_CHANNELS.blocking_lock();
+                        let channel = unlocked[channelId].clone();
+            
+                        if let Some(channel) = channel {
+                            channel.send(move |mut cx| {
+            
+                                let returnValue = cx.empty_array();
+                                let stats = cx.empty_object();
+                                let intCounters = INT_COUNTERS.blocking_lock();
+    
+                                let out = result.to_node_value(&mut cx)?;
+                                
+                                let interruptCount = if intCounters[channelId].0 > 0 {
+                                    cx.number(intCounters[channelId].1 as f64)
+                                } else {
+                                    cx.number(-1)
+                                };
+                                let totalCPU = cpu_time.elapsed().as_nanos();
+                                let evalTime =
+                                    cx.number(start_time.elapsed().as_nanos() as f64 / (1000f64 * 1000f64));
+                                let totalCPU = cx.number(totalCPU as f64 / (1000f64 * 1000f64));
+                                stats.set(&mut cx, "interrupts", interruptCount)?;
+                                stats.set(&mut cx, "evalTimeMs", evalTime)?;
+                                stats.set(&mut cx, "cpuTimeMs", totalCPU)?;
+                                returnValue.set(&mut cx, 1, stats)?;
+                                returnValue.set(&mut cx, 0, out)?;
+                                def.resolve(&mut cx, returnValue);
+            
+                                Ok(())
+                            });
+                        }
+                    }
+                    SyncChannelMsg::SendError { e, def } => {
+                        let unlocked = NODE_CHANNELS.blocking_lock();
+                        let channel = &unlocked[channelId];
+                        if let Some(channel) = channel {
+                            channel
+                                .send(move |mut cx| {
+                                    let msg = cx.string(e);
+                                    def.reject(&mut cx, msg);
+                                    Ok(())
+                                })
+                                .join()
+                                .unwrap();
+                        }
+                    }
+                    SyncChannelMsg::SendMessageToNode { message } => {
+                        let cbs = msgCBClone.clone();
+
+                        let unlocked = NODE_CHANNELS.blocking_lock();
+
+                        if let Some(channel) = &unlocked[channelId] {
+                            channel.send(move |mut cx| {
+                                let unlocked = cbs.blocking_lock();
+
+                                let out = message.to_node_value(&mut cx)?;
+
+                                for cbb in unlocked.iter() {
+                                    if cbb.1 == NodeCallbackTypes::Message {
+                                        cbb.0
+                                            .to_inner(&mut cx)
+                                            .call_with(&cx)
+                                            .arg(out)
+                                            .apply::<JsUndefined, TaskContext<'_>>(
+                                                &mut cx,
+                                            )?;
+                                    }
+                                }
+
+                                Ok(())
+                            });
+                        }
+                    }
+                    SyncChannelMsg::Memory { json, def } => {
+
+                        let nodeChannel = &NODE_CHANNELS.blocking_lock()[channelId];
+                        if let Some(channel) = nodeChannel {
+                            channel.send(move |mut cx| {
+                                let _obj = cx.empty_object();
+
+                                let jsonParse = cx
+                                    .global::<JsObject>("JSON")?
+                                    .get_value(&mut cx, "parse")?
+                                    .downcast::<JsFunction, _>(&mut cx)
+                                    .unwrap();
+                                let out = jsonParse
+                                    .call_with(&mut cx)
+                                    .arg(cx.string(json))
+                                    .apply::<JsObject, _>(&mut cx)?;
+
+                                def.resolve(&mut cx, out);
+                                Ok(())
+                            });
+                        }
+                    }
+                    SyncChannelMsg::LoadBytes { def } => {
+                        let unlocked = NODE_CHANNELS.blocking_lock();
+                        let channel = unlocked[channelId].clone();
+
+                        if let Some(channel) = channel {
+                            channel
+                                .send(move |mut cx| {
+                                    let val = cx.undefined();
+                                    def.resolve(&mut cx, val);
+
+                                    Ok(())
+                                })
+                                .join()
+                                .unwrap();
+                        }
+                    },
+                    SyncChannelMsg::GarbageCollect { start, def } => {
+                        let nodeChannel = NODE_CHANNELS.blocking_lock();
+                        if let Some(channel) = &nodeChannel[channelId] {
+                            channel
+                                .send(move |mut cx| {
+                                    let handle = cx.number(start.elapsed().as_millis() as f64);
+                                    def.resolve(&mut cx, handle);
+                                    Ok(())
+                                })
+                                .join()
+                                .unwrap();
+                        }
+                    },
+                    SyncChannelMsg::SendBytes { bytes, def } => {
+
+                        let unlocked = NODE_CHANNELS.blocking_lock();
+
+                        if let Some(channel) = &unlocked[channelId] {
+                            channel
+                                .send(move |mut cx| {
+                                    let jsonValue =
+                                        QuickJSWorker::vec_u8_to_NodeArray(&bytes, &mut cx)
+                                            .unwrap();
+
+                                    def.resolve(&mut cx, jsonValue);
+
+                                    Ok(())
+                                })
+                                .join()
+                                .unwrap();
+                        }
+                    },
+                    SyncChannelMsg::Quit { def } => {
+                        let cbs = msgCBClone.clone();
+
+                        let mut unlocked = NODE_CHANNELS.blocking_lock();
+    
+                        if let Some(channel) = &unlocked[channelId] {
+    
+                            // complete Promise on Node side
+                            channel
+                                .send(move |mut cx| {
+    
+                                    let unlocked_cbs = cbs.try_lock().unwrap();
+                                    
+                                    for cbb in unlocked_cbs.iter() {
+                                        if cbb.1 == NodeCallbackTypes::Close {
+                                            cbb.0
+                                                .to_inner(&mut cx)
+                                                .call_with(&cx)
+                                                .apply::<JsUndefined, TaskContext<'_>>(&mut cx)?;
+                                        }
+                                    }
+    
+                                    let handle = cx.undefined();
+                                    def.resolve(&mut cx, handle);
+                                    Ok(())
+                                })
+                                .join()
+                                .unwrap();
+                        }
+    
+                        // clean up memory
+                        unlocked[channelId] = None;
+
+                        // stop the thread
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // QuickJS Runtime Thread (async Tokio)
     thread::spawn(move || {
         let tokioRT = Runtime::new().unwrap();
 
@@ -787,7 +602,7 @@ pub fn quickjs_thread(
             // Init realm
             rt.lock()
                 .await
-                .loop_realm(None, move |runtime, realm| {
+                .loop_realm(None, move |_runtime, realm| {
                     // if enableSetImmediate {
                     //     // quickjs_runtime::features::setimmediate::init(runtime).unwrap();
                     // } else {
@@ -810,8 +625,24 @@ pub fn quickjs_thread(
                         )
                         .unwrap();
 
+                    quick_js_console!("log", console_log);
                     realm
-                        .install_function(&["console"], "log", QuickJSWorker::console_log, 1)
+                        .install_function(&["console"], "log", console_log, 1)
+                        .unwrap();
+
+                    quick_js_console!("info", console_info);
+                    realm
+                        .install_function(&["console"], "info", console_info, 1)
+                        .unwrap();
+
+                    quick_js_console!("warn", console_warn);
+                    realm
+                        .install_function(&["console"], "warn", console_warn, 1)
+                        .unwrap();
+
+                    quick_js_console!("error", console_error);
+                    realm
+                        .install_function(&["console"], "error", console_error, 1)
                         .unwrap();
 
                     realm
@@ -826,21 +657,12 @@ pub fn quickjs_thread(
 
             while let Some(message) = urx.recv().await {
                 // handle quit message
-                if let ChannelMsg::Quit { def } = message {
-                    let mut unlocked = NODE_CHANNELS.lock().await;
+                if let QuickChannelMsg::Quit { def } = message {
 
-                    if let Some(channel) = &unlocked[channelId] {
-                        channel
-                            .send(move |mut cx| {
-                                let handle = cx.undefined();
-                                def.resolve(&mut cx, handle);
-                                Ok(())
-                            })
-                            .join()
-                            .unwrap();
-                    }
+                    let syncChannel = SYNC_SENDERS.lock().await;
+                    syncChannel[channelId].send(SyncChannelMsg::Quit { def }).await.unwrap();
 
-                    unlocked[channelId] = None;
+                    // stop everything
                     break;
                 }
 
@@ -851,7 +673,86 @@ pub fn quickjs_thread(
                     let msgCBClone = msgCBClone.clone();
 
                     match message {
-                        ChannelMsg::GetByteCode { def, source } => {
+                        // ChannelMsg::ProcessAsync { future } => {
+
+                        // },
+                        QuickChannelMsg::InitGlobals => {
+
+                            // rtClone
+                            //     .lock()
+                            //     .await
+                            //     .loop_async(move |runtime| {
+                            //         let realm = runtime.get_main_realm();
+
+                            //         let callback = move |
+                            //             rt: &QuickJsRuntimeAdapter,
+                            //             realm: &QuickJsRealmAdapter,
+                            //             _: &QuickJsValueAdapter,
+                            //             args: &[QuickJsValueAdapter]| -> Result<QuickJsValueAdapter, quickjs_runtime::jsutils::JsError> {
+                                            
+                            //                 let channelID = realm
+                            //                     .get_object_property(&realm.get_global().unwrap(), "__CHANNELID")?
+                            //                     .to_i32() as usize;
+                            //                 let unlocked = NODE_CHANNELS.blocking_lock();
+                            //                 let channel = unlocked[channelID].clone();
+                                            
+                            //                 let jsTypeArg = JsDataTypes::from_quick_value(&args[0], realm)?;
+
+                            //                 if let Some(channel) = channel {
+                            //                     let resultType = channel
+                            //                         .send(move |mut cx| {
+
+                            //                             let mut globals = crate::GLOBAL_PTRS.blocking_lock();
+                            //                             let globalFns = &globals[channelID];
+                            //                             let (key, value) = &globalFns[globalFns.len() - 1];
+                            //                             let undefined = cx.undefined();
+                            //                             let callArg = jsTypeArg.to_node_value(&mut cx)?;
+
+                            //                             if let GlobalTypes::function { value } = value {
+                            //                                 let result = value.to_inner(&mut cx).call_with(&mut cx).arg(callArg).apply::<JsValue, _>(&mut cx)?;
+                            //                                 let dataType = JsDataTypes::from_node_value(result, &mut cx)?;
+                            //                                 return Ok(dataType);
+                            //                             }
+
+                            //                             Ok(JsDataTypes::Unknown)
+                                                        
+                            //                             // TODO: Handle functions that return a promise
+                            //                             // if result.is_a::<JsPromise, _>(&mut cx) {
+                            //                             //     let promise = result.downcast::<JsPromise, _>(&mut cx).unwrap();
+                            //                             //     let future = promise.to_future(&mut cx, |mut cx, result| {
+                            //                             //         Ok(2)
+                            //                             //     }).unwrap();
+                            //                             //     let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+                            //                             //     let (tx, rx) = oneshot::channel::<()>();
+                            //                             //     send_fn.blocking_send(ChannelMsg::ProcessAsync { future, tx }).unwrap();
+                            //                             // }
+
+                            //                         })
+                            //                         .join()
+                            //                         .unwrap();
+
+                            //                     return Ok(resultType.to_quick_value(realm).unwrap())
+                            //                 }
+
+                            //             Ok(realm.create_undefined().unwrap())
+                            //         };
+
+                            //         let someFn = realm.create_function("something", |
+                            //             realm,
+                            //             this: &QuickJsValueAdapter,
+                            //             args: &[QuickJsValueAdapter]| {
+
+                            //                 Ok(realm.create_undefined().unwrap())
+                            //         }, 2).unwrap();
+
+                            //         realm.set_object_property(&realm.get_global().unwrap(), "fnName", &someFn).unwrap();
+
+                            //         // realm.install_closure(&[], name.as_str(), callback, 1).unwrap();
+
+                            //     })
+                            //     .await;
+                        }
+                        QuickChannelMsg::GetByteCode { def, source } => {
                             let bytes = rtClone
                                 .lock()
                                 .await
@@ -872,25 +773,11 @@ pub fn quickjs_thread(
                                 })
                                 .await;
 
-                            let unlocked = NODE_CHANNELS.lock().await;
-                            let channel = unlocked[channelId].clone();
+                            let syncChannel = SYNC_SENDERS.lock().await;
+                            syncChannel[channelId].send(SyncChannelMsg::SendBytes { bytes, def }).await.unwrap();
 
-                            if let Some(channel) = channel {
-                                channel
-                                    .send(move |mut cx| {
-                                        let jsonValue =
-                                            QuickJSWorker::vec_u8_to_NodeArray(&bytes, &mut cx)
-                                                .unwrap();
-
-                                        def.resolve(&mut cx, jsonValue);
-
-                                        Ok(())
-                                    })
-                                    .join()
-                                    .unwrap();
-                            }
                         }
-                        ChannelMsg::LoadByteCode { bytes, def } => {
+                        QuickChannelMsg::LoadByteCode { bytes, def } => {
                             rtClone
                                 .lock()
                                 .await
@@ -909,157 +796,34 @@ pub fn quickjs_thread(
                                 })
                                 .await;
 
-                            let unlocked = NODE_CHANNELS.lock().await;
-                            let channel = unlocked[channelId].clone();
+                            let syncChannel = SYNC_SENDERS.lock().await;
+                            syncChannel[channelId].send(SyncChannelMsg::LoadBytes { def }).await.unwrap();
 
-                            if let Some(channel) = channel {
-                                channel
-                                    .send(move |mut cx| {
-                                        let val = cx.undefined();
-                                        def.resolve(&mut cx, val);
-
-                                        Ok(())
-                                    })
-                                    .join()
-                                    .unwrap();
-                            }
                         }
-                        ChannelMsg::GarbageCollect { def, start } => {
+                        QuickChannelMsg::GarbageCollect { def, start } => {
                             rtClone.lock().await.gc().await;
-                            let nodeChannel = &NODE_CHANNELS.lock().await;
-                            if let Some(channel) = &nodeChannel[channelId] {
-                                channel
-                                    .send(move |mut cx| {
-                                        let handle = cx.number(start.elapsed().as_millis() as f64);
-                                        def.resolve(&mut cx, handle);
-                                        Ok(())
-                                    })
-                                    .join()
-                                    .unwrap();
-                            }
+
+                            let syncChannel = SYNC_SENDERS.lock().await;
+                            syncChannel[channelId].send(SyncChannelMsg::GarbageCollect { start, def }).await.unwrap();
                         }
-                        ChannelMsg::Memory { def } => {
-                            rtClone
+                        QuickChannelMsg::Memory { def } => {
+                            let json = rtClone
                                 .lock()
                                 .await
                                 .loop_async(move |runtime| {
-                                    let realm = runtime.get_main_realm();
-                                    let nodeChannel = &NODE_CHANNELS.blocking_lock()[channelId];
 
-                                    let memory =
-                                        serde_json::to_string(&runtime.memory_usage()).unwrap();
+                                    return serde_json::to_string(&runtime.memory_usage()).unwrap();
 
-                                    if let Some(channel) = nodeChannel {
-                                        channel.send(move |mut cx| {
-                                            let obj = cx.empty_object();
-
-                                            let jsonParse = cx
-                                                .global::<JsObject>("JSON")?
-                                                .get_value(&mut cx, "parse")?
-                                                .downcast::<JsFunction, _>(&mut cx)
-                                                .unwrap();
-                                            let out = jsonParse
-                                                .call_with(&mut cx)
-                                                .arg(cx.string(memory))
-                                                .apply::<JsObject, _>(&mut cx)?;
-
-                                            def.resolve(&mut cx, out);
-                                            Ok(())
-                                        });
-                                    }
                                 })
                                 .await;
+
+                            let syncChannel = SYNC_SENDERS.lock().await;
+                            syncChannel[channelId].send(SyncChannelMsg::Memory { json, def }).await.unwrap();
                         }
-                        ChannelMsg::Quit { def } => {}
-                        ChannelMsg::Test {} => {}
-                        ChannelMsg::SendMessageToNode { message } => {
-                            let cbs = msgCBClone.clone();
-
-                            let unlocked = NODE_CHANNELS.lock().await;
-                            let channel = unlocked[channelId].clone();
-
-                            if let Some(channel) = channel {
-                                channel.send(move |mut cx| {
-                                    let unlocked = cbs.blocking_lock();
-
-                                    match message.clone() {
-                                        MessageTypes::Date { msg } => {
-                                            let out = cx.date(msg).unwrap();
-                                            for cbb in unlocked.iter() {
-                                                cbb.to_inner(&mut cx).call_with(&cx)
-                                                .arg(out)
-                                                .apply::<JsUndefined, TaskContext<'_>>(&mut cx)?;
-                                            }
-                                        }
-                                        MessageTypes::String { msg } => {
-                                            let out = cx.string(msg);
-                                            for cbb in unlocked.iter() {
-                                                cbb.to_inner(&mut cx).call_with(&cx)
-                                                .arg(out)
-                                                .apply::<JsUndefined, TaskContext<'_>>(&mut cx)?;
-                                            }
-                                        }
-                                        MessageTypes::Json { msg } => {
-                                            let jsonParse = cx
-                                                .global::<JsObject>("JSON")?
-                                                .get_value(&mut cx, "parse")?
-                                                .downcast::<JsFunction, _>(&mut cx)
-                                                .unwrap();
-                                            let out = jsonParse
-                                                .call_with(&mut cx)
-                                                .arg(cx.string(msg))
-                                                .apply::<JsObject, _>(&mut cx)?;
-
-                                            for cbb in unlocked.iter() {
-                                                cbb.to_inner(&mut cx).call_with(&cx)
-                                                .arg(out)
-                                                .apply::<JsUndefined, TaskContext<'_>>(&mut cx)?;
-                                            }
-                                        }
-                                        MessageTypes::Array { msg } => {
-                                            let jsonParse = cx
-                                                .global::<JsObject>("JSON")?
-                                                .get_value(&mut cx, "parse")?
-                                                .downcast::<JsFunction, _>(&mut cx)
-                                                .unwrap();
-                                            let out = jsonParse
-                                                .call_with(&mut cx)
-                                                .arg(cx.string(msg))
-                                                .apply::<JsArray, _>(&mut cx)?;
-
-                                            for cbb in unlocked.iter() {
-                                                cbb.to_inner(&mut cx).call_with(&cx)
-                                                .arg(out)
-                                                .apply::<JsUndefined, TaskContext<'_>>(&mut cx)?;
-                                            }
-                                        }
-                                        MessageTypes::Number { msg } => {
-                                            for cbb in unlocked.iter() {
-                                                cbb.to_inner(&mut cx)
-                                                    .call_with(&cx)
-                                                    .arg(cx.number(msg))
-                                                    .apply::<JsUndefined, TaskContext<'_>>(
-                                                        &mut cx,
-                                                    )?;
-                                            }
-                                        }
-                                        MessageTypes::Boolean { msg } => {
-                                            for cbb in unlocked.iter() {
-                                                cbb.to_inner(&mut cx)
-                                                    .call_with(&cx)
-                                                    .arg(cx.boolean(msg))
-                                                    .apply::<JsUndefined, TaskContext<'_>>(
-                                                        &mut cx,
-                                                    )?;
-                                            }
-                                        }
-                                    }
-
-                                    Ok(())
-                                });
-                            }
+                        QuickChannelMsg::Quit { def: _ } => {
+                            // handled in upper loop
                         }
-                        ChannelMsg::SendMessageToQuick { message } => {
+                        QuickChannelMsg::SendMessageToQuick { message } => {
                             rtClone
                                 .lock()
                                 .await
@@ -1083,43 +847,8 @@ pub fn quickjs_thread(
                                         .map(|cb| realm.from_js_value_facade(cb).unwrap())
                                         .collect();
 
-                                    let callbackMsg = match message {
-                                        MessageTypes::Date { msg } => {
-                                            let DateFn = realm
-                                                .get_object_property(
-                                                    &realm.get_global().unwrap(),
-                                                    "Date",
-                                                )
-                                                .unwrap();
-                                            let dateObj = realm
-                                                .construct_object(
-                                                    &DateFn,
-                                                    &[&realm.create_f64(msg).unwrap()],
-                                                )
-                                                .unwrap();
-                                            realm.to_js_value_facade(&dateObj).unwrap()
-                                        }
-                                        MessageTypes::String { msg } => msg.to_js_value_facade(),
-                                        MessageTypes::Json { msg } => realm
-                                            .to_js_value_facade(
-                                                &realm.json_parse(msg.as_str()).unwrap(),
-                                            )
-                                            .unwrap(),
-                                        MessageTypes::Array { msg } => realm
-                                            .to_js_value_facade(
-                                                &realm.json_parse(msg.as_str()).unwrap(),
-                                            )
-                                            .unwrap(),
-                                        MessageTypes::Number { msg } => realm
-                                            .to_js_value_facade(&realm.create_f64(msg).unwrap())
-                                            .unwrap(),
-                                        MessageTypes::Boolean { msg } => realm
-                                            .to_js_value_facade(&realm.create_boolean(msg).unwrap())
-                                            .unwrap(),
-                                    };
 
-                                    let callbackValue =
-                                        realm.from_js_value_facade(callbackMsg).unwrap();
+                                    let callbackValue = message.to_quick_value(realm).unwrap();
 
                                     for i in 0..parsedCallbacks.len() {
                                         realm
@@ -1137,12 +866,12 @@ pub fn quickjs_thread(
                                 })
                                 .await;
                         }
-                        ChannelMsg::NewCallback { root } => {
+                        QuickChannelMsg::NewCallback { root, on } => {
                             let cbs = msgCBClone.clone();
                             let mut unlocked = cbs.lock().await;
-                            unlocked.push(root);
+                            unlocked.push((root, on));
                         }
-                        ChannelMsg::EvalScript { source, def } => {
+                        QuickChannelMsg::EvalScript { source, def } => {
                             {
                                 // reset inturupt counter
                                 let mut intCounters = INT_COUNTERS.lock().await;
@@ -1151,7 +880,7 @@ pub fn quickjs_thread(
 
                             let script_future = rtClone.lock().await.loop_async(move |runtime| {
                                 let realm = runtime.get_main_realm();
-                                match realm.eval(Script::new(".", &source)) {
+                                match realm.eval(Script::new("./", &source)) {
                                     Ok(eval_result) => {
                                         return realm.to_js_value_facade(&eval_result);
                                     }
@@ -1171,18 +900,8 @@ pub fn quickjs_thread(
                                 .await
                                 {
                                     Err(e) => {
-                                        let unlocked = NODE_CHANNELS.lock().await;
-                                        let channel = unlocked[channelId].clone();
-                                        if let Some(channel) = channel {
-                                            channel
-                                                .send(move |mut cx| {
-                                                    let msg = cx.string(e.to_string());
-                                                    def.reject(&mut cx, msg);
-                                                    Ok(())
-                                                })
-                                                .join()
-                                                .unwrap();
-                                        }
+                                        let syncChannel = SYNC_SENDERS.lock().await;
+                                        syncChannel[channelId].send(SyncChannelMsg::SendError { e: e.to_string(), def }).await.unwrap();
                                         return;
                                     }
                                     Ok(script_result) => {
