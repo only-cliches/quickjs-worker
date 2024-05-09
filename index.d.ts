@@ -13,28 +13,38 @@ export type Primitive = string | number | boolean;
 export const QuickJSWorker: (args?: {
     /** Capture console commands from the runtime */
     console?: {
-        log: (value: any) => any,
-        warn: (value: any) => any,
-        info: (value: any) => any,
-        error: (value: any) => any,
+        log: (...values: any) => any,
+        warn: (...values: any) => any,
+        info: (...values: any) => any,
+        error: (...values: any) => any,
     },
-    /** Set the maxmimum milliseconds each call to .eval() is allowed to take. */
+    /** 
+     * How big is the message queue used by the runtime? 
+     * A message queue is used to pass commands and values between Node and the QuickJS runtime.  When the message queue is full, subsequent commands will fail and cause an error.
+     * bigger channel = more memory
+     * Values under 3 are not recommended
+     * 
+     * Default is 10.
+    */
+    channelSize?: number,
+    /** Set the maxmimum milliseconds each call to eval is allowed to take. Default is unlimited. */
     maxEvalMs?: number,
-    /** Set the maxmimum total bytes the runtime is allowed to use for memory */
+    /** Set the maxmimum total bytes the runtime is allowed to use for memory. Default is unlimited. */
     maxMemoryBytes?: number,
-    /** Set the maxmimum stack size bytes the runtime is allowed to use for memory */
+    /** Set the maxmimum stack size bytes the runtime is allowed to use for memory. Default is unlimited. */
     maxStackSizeBytes?: number,
     /**
-     * When .eval() is called, an interrupt handler is ran internally from time to time to see if execution should continue.
-     * Once the number of interrupt calls reaches the threshold provided here, the .eval() call will be terminated.
-     * Prevents while(true) loops, more interrupts allow more code exection.
+     * When eval is called, an interrupt handler is ran internally from time to time to see if execution should continue.
+     * Once the number of interrupt calls reaches the threshold provided here, the eval call will be terminated.
+     * Prevents while(true) loops, more interrupts allow more code exection.  Default is unlimited.
      */
     maxInterrupt?: number,
     /** How many allocations can the runtime do before the GC runs? */
     gcThresholdAlloc?: number,
     /** Automatically run the GC at regular intervals */
     gcIntervalMs?: number,
-    globals?: {
+    /** Provide static callbacks and primitives to the runtime */
+    staticGlobals?: {
         [key: string]: Primitive | Date | Array<Primitive> | {[key: string]: Primitive} | ((arg: any) => any)
     }
     // imports: (moduleName) => {
@@ -46,12 +56,13 @@ export const QuickJSWorker: (args?: {
     // setImmediate: true
 }) => {
     /** 
-     * Evaluate Javascript code in the virtual machine, will recursively resolve promises that are returned.
+     * Evaluate Javascript code in the virtual machine, will recursively resolve promises that are returned from .eval and .evalSync.
      * Primitives, JSON and Arrays can returned across the eval barrier without an issue.
      * There is a serialization/deserialization cost when returning Arrays and JSON.
      * 
      * */
-    eval: <T>(jsSourceCode: string) => Promise<[T, EvalStats]>
+    eval: <T>(jsSourceCode: string, scriptName?: string) => Promise<[T, EvalStats]>,
+    evalSync: <T>(jsSourceCode: string, scriptName?: string) => [T, EvalStats]
     /** Handle postMessage() events from the virtual machine */
     on: (type: "message" | "close", callback: (event: any) => void) => void
     /** Convert a block of source code into QuickJS ByteCode */
@@ -103,5 +114,5 @@ export const QuickJSWorker: (args?: {
      * Primitives, JSON and Arrays can sent to the runtime using this function.
      * There is a serialization/deserialization cost when sending Arrays and JSON.
      * */
-    postMessage: (message: any) => Promise<void>
+    postMessage: (message: any) => void
 }

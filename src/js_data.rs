@@ -11,7 +11,27 @@ pub enum JsDataTypes {
     Array { msg: String },
     Number { msg: f64 },
     Boolean { msg: bool },
-    Date { msg: f64 },
+    Date { msg: f64 }
+}
+
+
+impl ToString for JsDataTypes {
+    fn to_string(&self) -> String {
+        match self {
+            JsDataTypes::Date { msg } => {
+                let msg_str = msg.to_string();
+                std::format!("new Date({msg_str})")
+            }
+            JsDataTypes::String { msg } => std::format!("`{msg}`"),
+            JsDataTypes::Json { msg } => msg.clone(),
+            JsDataTypes::Array { msg } => msg.clone(),
+            JsDataTypes::Number { msg } => msg.to_string(),
+            JsDataTypes::Boolean { msg } => if *msg { String::from("true") } else { String::from("false") },
+            JsDataTypes::Undefined => String::from("undefined"),
+            JsDataTypes::Null => String::from("null"),
+            JsDataTypes::Unknown => String::from("undefined")
+        }
+    }
 }
 
 impl JsDataTypes {
@@ -19,14 +39,14 @@ impl JsDataTypes {
     pub fn to_quick_value(&self, realm: &QuickJsRealmAdapter) -> Result<QuickJsValueAdapter, JsError> {
         match self {
             JsDataTypes::Date { msg } => {
-                let DateFn = realm
+                let date_fn = realm
                     .get_object_property(
                         &realm.get_global()?,
                         "Date",
                     )?;
                 realm
                     .construct_object(
-                        &DateFn,
+                        &date_fn,
                         &[&realm.create_f64(*msg).unwrap()],
                     )
             }
@@ -37,7 +57,7 @@ impl JsDataTypes {
             JsDataTypes::Boolean { msg } => realm.create_boolean(*msg),
             JsDataTypes::Undefined => realm.create_undefined(),
             JsDataTypes::Null => realm.create_null(),
-            JsDataTypes::Unknown => todo!(),
+            JsDataTypes::Unknown => realm.create_undefined(),
         }
     }
 
@@ -48,17 +68,18 @@ impl JsDataTypes {
             quickjs_runtime::jsutils::JsValueType::String => Ok(JsDataTypes::String { msg: value.to_string()? }),
             quickjs_runtime::jsutils::JsValueType::Boolean => Ok(JsDataTypes::Boolean { msg: value.to_bool() }),
             quickjs_runtime::jsutils::JsValueType::Object => {
-                let getTime = realm.get_object_property(value, "getTime")?;
-                if getTime.is_undefined() {
+                let get_time = realm.get_object_property(value, "getTime")?;
+                if get_time.is_undefined() { // standard object
                     let msg = realm.json_stringify(value, None)?;
                     Ok(JsDataTypes::Json { msg })
-                } else {
-                    let time = realm.invoke_function(Some(value), &getTime, &[])?;
+                } else { // date
+                    let time = realm.invoke_function(Some(value), &get_time, &[])?;
                     let msg = time.to_f64();
                     Ok(JsDataTypes::Date { msg })
                 }
             }
             quickjs_runtime::jsutils::JsValueType::Array => Ok(JsDataTypes::Array { msg: realm.json_stringify(value, None)? }),
+            // Date objects don't go here for some reason, they're treated as objects
             // quickjs_runtime::jsutils::JsValueType::Date => {
             //     let getTime = realm.get_object_property(value, "getTime")?;
             //     let time = realm.invoke_function(None, &getTime, &[])?;
@@ -83,17 +104,17 @@ impl JsDataTypes {
 
     pub fn to_node_value<'a, C: Context<'a>>(&self, cxf: &mut C) -> Result<Handle<'a, JsValue>, Throw> {
         match self {
-            JsDataTypes::Unknown => cxf.throw_error("Uknown type!"),
+            JsDataTypes::Unknown => Ok(cxf.undefined().as_value(cxf)),
             JsDataTypes::Undefined => Ok(cxf.undefined().as_value(cxf)),
             JsDataTypes::Null => Ok(cxf.null().as_value(cxf)),
             JsDataTypes::String { msg } => Ok(cxf.string(msg).as_value(cxf)),
             JsDataTypes::Json { msg } =>  {
-                let jsonParse = cxf
+                let json_parse = cxf
                 .global::<JsObject>("JSON")?
                 .get_value(cxf, "parse")?
                 .downcast::<JsFunction, _>(cxf)
                 .unwrap();
-                let out = jsonParse
+                let out = json_parse
                     .call_with(cxf)
                     .arg(cxf.string(msg))
                     .apply::<JsObject, _>(cxf)?;
@@ -101,12 +122,12 @@ impl JsDataTypes {
                 Ok(out.as_value(cxf))
             },
             JsDataTypes::Array { msg } => {
-                let jsonParse = cxf
+                let json_parse = cxf
                 .global::<JsObject>("JSON")?
                 .get_value(cxf, "parse")?
                 .downcast::<JsFunction, _>(cxf)
                 .unwrap();
-                let out = jsonParse
+                let out = json_parse
                     .call_with(cxf)
                     .arg(cxf.string(msg))
                     .apply::<JsObject, _>(cxf)?;
@@ -116,6 +137,7 @@ impl JsDataTypes {
             JsDataTypes::Number { msg } => Ok(cxf.number(*msg).as_value(cxf)),
             JsDataTypes::Boolean { msg } => Ok(cxf.boolean(*msg).as_value(cxf)),
             JsDataTypes::Date { msg } => Ok(cxf.date(*msg).unwrap().as_value(cxf)),
+            // _ => cxf.throw_error("hello"),
         }
     }
 
@@ -134,12 +156,12 @@ impl JsDataTypes {
                 .value(cxf);
             return Ok(JsDataTypes::String { msg })
         } else if value.is_a::<JsObject, _>(cxf) || value.is_a::<JsArray, _>(cxf) {
-            let jsonStringify = cxf
+            let json_stringify = cxf
                 .global::<JsObject>("JSON")?
                 .get_value(cxf, "stringify")?
                 .downcast::<JsFunction, _>(cxf)
                 .unwrap();
-            let msg = jsonStringify
+            let msg = json_stringify
                 .call_with(cxf)
                 .arg(value)
                 .apply::<JsString, _>(cxf)?

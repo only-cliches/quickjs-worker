@@ -1,19 +1,10 @@
 use js_data::JsDataTypes;
 use lazy_static::lazy_static;
 use neon::prelude::*;
-use neon::types::{Deferred};
-
-
-
-
-
+use neon::types::Deferred;
 use quickjs_runtime::values::JsValueFacade;
-
-
 use std::sync::Arc;
-
 use std::time::Instant;
-
 use tokio::sync::mpsc;
 
 pub mod qjs;
@@ -35,8 +26,8 @@ pub struct NodeCallbacks {
 }
 
 pub enum GlobalTypes {
-    function { value: Root<JsFunction> },
-    data { value: JsDataTypes }
+    Function { value: Root<JsFunction> },
+    Data { value: JsDataTypes }
 }
 
 lazy_static! {
@@ -57,6 +48,10 @@ lazy_static! {
 }
 
 pub enum SyncChannelMsg {
+    ProcessAsync {
+        future: neon::types::JsFuture<JsDataTypes>,
+        tx: tokio::sync::oneshot::Sender<JsDataTypes>
+    },
     Quit { def: Deferred },
     SendBytes { bytes: Vec<u8>, def: Deferred },
     LoadBytes { def: Deferred },
@@ -69,8 +64,12 @@ pub enum SyncChannelMsg {
         message: JsDataTypes,
     },
     SendError { e: String, def: Deferred },
-    RespondEval { def: Deferred, result: JsDataTypes,         cpu_time: cpu_time::ProcessTime,
-        start_time: Instant }
+    RespondEval { 
+        def: Deferred, 
+        result: JsDataTypes,         
+        cpu_time: cpu_time::ProcessTime,
+        start_time: Instant 
+    }
 }
 
 #[derive(PartialEq)]
@@ -83,15 +82,9 @@ pub enum QuickChannelMsg {
     Quit {
         def: Deferred,
     },
-    // SendMessageToNode {
-    //     message: JsDataTypes,
-    // },
     SendMessageToQuick {
         message: JsDataTypes,
     },
-    // ProcessAsync {
-    //     future: JsFuture<i32>
-    // },
     InitGlobals,
     NewCallback {
         on: NodeCallbackTypes,
@@ -113,56 +106,72 @@ pub enum QuickChannelMsg {
         def: Deferred,
     },
     EvalScript {
-        def: Deferred,
+        script_name: String,
+        target: ScriptEvalType,
         source: String,
     },
 }
 
+pub enum ScriptEvalType {
+    Sync { sender: tokio::sync::oneshot::Sender<Result<(JsDataTypes, cpu_time::ProcessTime, Instant), String>> },
+    Async { promise: Deferred }
+}
 
 
 #[derive(Debug, Default, Clone)]
 pub struct QuickJSOptions {
-    enableSetTimeout: bool,
-    enableSetImmediate: bool,
-    maxMemory: Option<u64>,
-    maxStackSize: Option<u64>,
-    gcThreshold: Option<u64>,
-    gcInterval: Option<u64>,
-    maxInt: Option<u64>,
-    maxEvalTime: Option<u64>,
+    max_memory: Option<u64>,
+    max_stack_size: Option<u64>,
+    gc_threshold: Option<u64>,
+    gc_interval: Option<u64>,
+    max_int: Option<u64>,
+    max_eval_time: Option<u64>,
 }
 
 fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
-    let (channelId, urx, urx2) = {
-        let (utx, urx) = mpsc::channel::<QuickChannelMsg>(10);
-        let (utx2, urx2) = mpsc::channel::<SyncChannelMsg>(10);
-        let mut channelVec = NODE_CHANNELS.blocking_lock();
-        let mut senderVec = QUICKJS_SENDERS.blocking_lock();
-        let mut callbackVec = NODE_CALLBACKS.blocking_lock();
-        let mut callbackVec2 = QUICKJS_CALLBACKS.blocking_lock();
-        let mut intCounters = INT_COUNTERS.blocking_lock();
-        let mut globals = GLOBAL_PTRS.blocking_lock();
-        let mut syncVec = SYNC_SENDERS.blocking_lock();
-        let id = channelVec.len();
 
-        channelVec.push(Some(cx.channel()));
-        senderVec.push(utx);
-        callbackVec.push(NodeCallbacks::default());
-        callbackVec2.push(Vec::new());
-        intCounters.push((-1, 0));
+    let mut channel_size = 10usize;
+    if let Some(args_obj) = cx.argument_opt(0) {
+        if let Ok(args_obj) = args_obj.downcast::<JsObject, _>(&mut cx) {
+            if let Ok(value) = args_obj.get_value(&mut cx, "channelSize") {
+                if let Ok(value) = value.downcast::<JsNumber, _>(&mut cx) {
+                    channel_size = value.value(&mut cx) as usize;
+                }
+            }
+        }
+    }
+
+    let (channel_id, urx, urx2) = {
+        let (utx, urx) = mpsc::channel::<QuickChannelMsg>(channel_size);
+        let (utx2, urx2) = mpsc::channel::<SyncChannelMsg>(channel_size);
+        let mut channel_vec = NODE_CHANNELS.blocking_lock();
+        let mut sender_vec = QUICKJS_SENDERS.blocking_lock();
+        let mut callback_vec = NODE_CALLBACKS.blocking_lock();
+        let mut quick_callback_vec = QUICKJS_CALLBACKS.blocking_lock();
+        let mut int_counters = INT_COUNTERS.blocking_lock();
+        let mut globals = GLOBAL_PTRS.blocking_lock();
+        let mut sync_vec = SYNC_SENDERS.blocking_lock();
+        let id = channel_vec.len();
+
+        channel_vec.push(Some(cx.channel()));
+        sender_vec.push(utx);
+        callback_vec.push(NodeCallbacks::default());
+        quick_callback_vec.push(Vec::new());
+        int_counters.push((-1, 0));
         globals.push(Vec::new());
-        syncVec.push(utx2);
+        sync_vec.push(utx2);
 
         (id, urx, urx2)
     };
 
-    let mut NodeCallbacks = NodeCallbacks::default();
-    let mut consoleStruct = NodeConsole::default();
+    let mut node_callbacks = NodeCallbacks::default();
+    let mut console_struct = NodeConsole::default();
 
-    let mut Options = QuickJSOptions::default();
+    let mut options = QuickJSOptions::default();
 
     if let Some(args_obj) = cx.argument_opt(0) {
         if let Ok(args_obj) = args_obj.downcast::<JsObject, _>(&mut cx) {
+
             // handle optional "require" callback
             // if let Ok(value) = args_obj.get_value(&mut cx, "imports") {
             //     if let Ok(callback) = value.downcast::<JsFunction, _>(&mut cx) {
@@ -195,157 +204,154 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
             if let Ok(value) = args_obj.get_value(&mut cx, "maxInterrupt") {
                 if let Ok(value) = value.downcast::<JsNumber, _>(&mut cx) {
-                    Options.maxInt = Some(value.value(&mut cx) as u64);
+                    options.max_int = Some(value.value(&mut cx) as u64);
                 }
             }
 
             if let Ok(value) = args_obj.get_value(&mut cx, "maxMemoryBytes") {
                 if let Ok(value) = value.downcast::<JsNumber, _>(&mut cx) {
-                    Options.maxMemory = Some(value.value(&mut cx) as u64);
+                    options.max_memory = Some(value.value(&mut cx) as u64);
                 }
             }
 
             if let Ok(value) = args_obj.get_value(&mut cx, "maxStackSizeBytes") {
                 if let Ok(value) = value.downcast::<JsNumber, _>(&mut cx) {
-                    Options.maxStackSize = Some(value.value(&mut cx) as u64);
+                    options.max_stack_size = Some(value.value(&mut cx) as u64);
                 }
             }
 
             if let Ok(value) = args_obj.get_value(&mut cx, "maxEvalMs") {
                 if let Ok(value) = value.downcast::<JsNumber, _>(&mut cx) {
-                    Options.maxEvalTime = Some(value.value(&mut cx) as u64);
+                    options.max_eval_time = Some(value.value(&mut cx) as u64);
                 }
             }
 
             if let Ok(value) = args_obj.get_value(&mut cx, "gcThresholdAlloc") {
                 if let Ok(value) = value.downcast::<JsNumber, _>(&mut cx) {
-                    Options.gcThreshold = Some(value.value(&mut cx) as u64);
+                    options.gc_threshold = Some(value.value(&mut cx) as u64);
                 }
             }
 
             if let Ok(value) = args_obj.get_value(&mut cx, "gcIntervalMs") {
                 if let Ok(value) = value.downcast::<JsNumber, _>(&mut cx) {
-                    Options.gcInterval = Some(value.value(&mut cx) as u64);
+                    options.gc_interval = Some(value.value(&mut cx) as u64);
                 }
             }
 
             if let Ok(value) = args_obj.get_value(&mut cx, "console") {
-                if let Ok(consoleObj) = value.downcast::<JsObject, _>(&mut cx) {
-                    if let Ok(log) = consoleObj.get_value(&mut cx, "log") {
+                if let Ok(console_obj) = value.downcast::<JsObject, _>(&mut cx) {
+                    if let Ok(log) = console_obj.get_value(&mut cx, "log") {
                         if let Ok(callback) = log.downcast::<JsFunction, _>(&mut cx) {
-                            consoleStruct.log = Some(callback.root(&mut cx));
+                            console_struct.log = Some(callback.root(&mut cx));
                         }
                     }
-                    if let Ok(log) = consoleObj.get_value(&mut cx, "info") {
+                    if let Ok(log) = console_obj.get_value(&mut cx, "info") {
                         if let Ok(callback) = log.downcast::<JsFunction, _>(&mut cx) {
-                            consoleStruct.info = Some(callback.root(&mut cx));
+                            console_struct.info = Some(callback.root(&mut cx));
                         }
                     }
-                    if let Ok(log) = consoleObj.get_value(&mut cx, "error") {
+                    if let Ok(log) = console_obj.get_value(&mut cx, "error") {
                         if let Ok(callback) = log.downcast::<JsFunction, _>(&mut cx) {
-                            consoleStruct.error = Some(callback.root(&mut cx));
+                            console_struct.error = Some(callback.root(&mut cx));
                         }
                     }
-                    if let Ok(log) = consoleObj.get_value(&mut cx, "warn") {
+                    if let Ok(log) = console_obj.get_value(&mut cx, "warn") {
                         if let Ok(callback) = log.downcast::<JsFunction, _>(&mut cx) {
-                            consoleStruct.warn = Some(callback.root(&mut cx));
+                            console_struct.warn = Some(callback.root(&mut cx));
                         }
                     }
                 }
             }
 
-            if let Ok(value) = args_obj.get_value(&mut cx, "globals") {
+            if let Ok(value) = args_obj.get_value(&mut cx, "staticGlobals") {
                 if let Ok(globals) = value.downcast::<JsObject, _>(&mut cx) {
 
-                    let ObjectKeys = cx
+                    let object_keys = cx
                     .global::<JsFunction>("Object")?
                     .get_value(&mut cx, "keys")?
                     .downcast::<JsFunction, _>(&mut cx)
                     .unwrap();
 
-                    let keys = ObjectKeys
+                    let keys = object_keys
                         .call_with(&mut cx)
                         .arg(globals)
                         .apply::<JsArray, _>(&mut cx)?;
 
-                    let mut globalsArray = GLOBAL_PTRS.blocking_lock();
+                    let mut globals_array = GLOBAL_PTRS.blocking_lock();
 
                     for i in 0..keys.len(&mut cx) {
                         let key = keys.get_value(&mut cx, i)?.downcast::<JsString, _>(&mut cx).unwrap().value(&mut cx);
                         let value = globals.get_value(&mut cx, key.as_str()).unwrap();
 
-                        if let Ok(fnCallback) = value.downcast::<JsFunction, _>(&mut cx) {
-                            globalsArray[channelId].push((key.clone(), GlobalTypes::function { value: fnCallback.root(&mut cx) }));
+                        if let Ok(fn_callback) = value.downcast::<JsFunction, _>(&mut cx) {
+                            globals_array[channel_id].push((key.clone(), GlobalTypes::Function { value: fn_callback.root(&mut cx) }));
                         } else {
-                            globalsArray[channelId].push((key.clone(), GlobalTypes::data { value: JsDataTypes::from_node_value(value, &mut cx)? }));
+                            globals_array[channel_id].push((key.clone(), GlobalTypes::Data { value: JsDataTypes::from_node_value(value, &mut cx)? }));
                         }
                     }
 
-                    let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+                    let send_fn = &QUICKJS_SENDERS.blocking_lock()[channel_id];
                     send_fn
                     .blocking_send(QuickChannelMsg::InitGlobals)
                     .unwrap();
-
                 }
             }
         }
     }
 
-    NodeCallbacks.console = consoleStruct;
+    node_callbacks.console = console_struct;
 
     {
-        let mut callbackVec = NODE_CALLBACKS.blocking_lock();
-        callbackVec[channelId] = NodeCallbacks;
+        let mut callback_vec = NODE_CALLBACKS.blocking_lock();
+        callback_vec[channel_id] = node_callbacks;
     }
 
-    qjs::quickjs_thread(Options, channelId, urx, urx2);
+    qjs::quickjs_thread(options, channel_id, urx, urx2);
 
     // set return object for module
     let return_obj = cx.empty_object();
 
     let is_closed = Arc::new(std::sync::Mutex::new(false));
 
-    let sendFn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+    let post_message_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+        let quick_chnl = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
 
         let value = cxf.argument::<JsValue>(0).unwrap();
 
         let msg = JsDataTypes::from_node_value(value, &mut cxf).unwrap();
-
-        send_fn
+        quick_chnl
         .blocking_send(QuickChannelMsg::SendMessageToQuick {
             message: msg,
-        })
-        .unwrap();
+        }).unwrap_or(());
 
         return Ok(cxf.undefined());
     })
     .unwrap();
 
-    return_obj.set(&mut cx, "postMessage", sendFn).unwrap();
+    return_obj.set(&mut cx, "postMessage", post_message_fn).unwrap();
 
-    let closedClone = is_closed.clone();
-    let killFn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        let closed = &mut closedClone.lock().unwrap();
+    let close_clone = is_closed.clone();
+    let kill_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+        let closed = &mut close_clone.lock().unwrap();
         if **closed == true {
             return cxf.throw_error("Runtime is closed");
         }
         **closed = true;
 
-        let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let (deferred, promise) = cxf.promise();
         send_fn
             .blocking_send(QuickChannelMsg::Quit { def: deferred })
-            .unwrap();
+            .unwrap_or(());
 
         return Ok(promise);
     })
     .unwrap();
-    return_obj.set(&mut cx, "close", killFn).unwrap();
+    return_obj.set(&mut cx, "close", kill_fn).unwrap();
 
-    let closedClone = is_closed.clone();
+    let closed_clone = is_closed.clone();
     let is_closed_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        let closed = &mut closedClone.lock().unwrap();
+        let closed = &mut closed_clone.lock().unwrap();
         if **closed == true {
             return Ok(cxf.boolean(true));
         } else {
@@ -355,22 +361,23 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     .unwrap();
     return_obj.set(&mut cx, "isClosed", is_closed_fn).unwrap();
 
-    let closedClone = is_closed.clone();
-    let onFn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
-        let onType = cxf.argument::<JsString>(0)?.value(&mut cxf);
-        match onType.as_str() {
+    let closed_clone = is_closed.clone();
+    let on_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+        if *closed_clone.lock().unwrap() == true {
+            return cxf.throw_error("Runtime is closed");
+        }
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
+        let on_type = cxf.argument::<JsString>(0)?.value(&mut cxf);
+        match on_type.as_str() {
             "message" => {
-                if *closedClone.lock().unwrap() == true {
-                    return cxf.throw_error("Runtime is closed");
-                }
+
                 let cb_fn = cxf.argument::<JsFunction>(1)?.root(&mut cxf);
                 send_fn
                     .blocking_send(QuickChannelMsg::NewCallback {
                         on: NodeCallbackTypes::Message,
                         root: cb_fn,
                     })
-                    .unwrap();
+                    .unwrap_or(());
             }
             "close" => {
                 let cb_fn = cxf.argument::<JsFunction>(1)?.root(&mut cxf);
@@ -379,68 +386,73 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                         on: NodeCallbackTypes::Close,
                         root: cb_fn,
                     })
-                    .unwrap();
+                    .unwrap_or(());
             }
             _ => {}
         }
         return Ok(cxf.undefined());
     })
     .unwrap();
-    return_obj.set(&mut cx, "on", onFn).unwrap();
+    return_obj.set(&mut cx, "on", on_fn).unwrap();
 
-    let closedClone = is_closed.clone();
+    let closed_clone = is_closed.clone();
     let memory_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        if *closedClone.lock().unwrap() == true {
+        if *closed_clone.lock().unwrap() == true {
             return cxf.throw_error("Runtime is closed");
         }
 
-        let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let (deferred, promise) = cxf.promise();
         send_fn
             .blocking_send(QuickChannelMsg::Memory { def: deferred })
-            .unwrap();
+            .unwrap_or(());
 
         return Ok(promise);
     })
     .unwrap();
     return_obj.set(&mut cx, "memory", memory_fn).unwrap();
 
-    let closedClone = is_closed.clone();
+    let closed_clone = is_closed.clone();
     let gc_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        if *closedClone.lock().unwrap() == true {
+        if *closed_clone.lock().unwrap() == true {
             return cxf.throw_error("Runtime is closed");
         }
 
-        let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let (deferred, promise) = cxf.promise();
         send_fn
             .blocking_send(QuickChannelMsg::GarbageCollect {
                 def: deferred,
                 start: Instant::now(),
             })
-            .unwrap();
+            .unwrap_or(());
 
         return Ok(promise);
     })
     .unwrap();
     return_obj.set(&mut cx, "gc", gc_fn).unwrap();
 
-    let closedClone = is_closed.clone();
+    let closed_clone = is_closed.clone();
     let eval_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        if *closedClone.lock().unwrap() == true {
+        if *closed_clone.lock().unwrap() == true {
             return cxf.throw_error("Runtime is closed");
         }
 
-        let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
         let (deferred, promise) = cxf.promise();
 
+        let script_name = if let Some(args_obj) = cxf.argument_opt(1) { 
+            args_obj.downcast_or_throw::<JsString, _>(&mut cxf)?.value(&mut cxf)
+        } else { String::from("./") };
+
         send_fn
             .blocking_send(QuickChannelMsg::EvalScript {
+                script_name,
                 source: String::from(script),
-                def: deferred,
+                target: ScriptEvalType::Async { promise: deferred }
             })
-            .unwrap();
+            .unwrap_or(());
 
         return Ok(promise);
     })
@@ -448,13 +460,69 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
     return_obj.set(&mut cx, "eval", eval_fn).unwrap();
 
-    let closedClone = is_closed.clone();
-    let to_byte_code = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        if *closedClone.lock().unwrap() == true {
+    let closed_clone = is_closed.clone();
+    let eval_sync_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+        if *closed_clone.lock().unwrap() == true {
             return cxf.throw_error("Runtime is closed");
         }
 
-        let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
+        let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
+
+        let script_name = if let Some(args_obj) = cxf.argument_opt(1) { 
+            args_obj.downcast_or_throw::<JsString, _>(&mut cxf)?.value(&mut cxf)
+        } else { String::from("./") };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        send_fn
+            .blocking_send(QuickChannelMsg::EvalScript {
+                script_name,
+                source: String::from(script),
+                target: ScriptEvalType::Sync { sender: tx }
+            })
+            .unwrap();
+
+        let result = rx.blocking_recv().unwrap();
+
+        match result {
+            Ok((data, cpu_time, start_time)) => {
+
+                let return_value = cxf.empty_array();
+                let stats = cxf.empty_object();
+                let int_counters = INT_COUNTERS.blocking_lock();
+
+                let out = data.to_node_value(&mut cxf)?;
+                
+                let interrupt_count = if int_counters[channel_id].0 > 0 {
+                    cxf.number(int_counters[channel_id].1 as f64)
+                } else {
+                    cxf.number(-1)
+                };
+                let total_cpu = cpu_time.elapsed().as_nanos();
+                let eval_time =
+                    cxf.number(start_time.elapsed().as_nanos() as f64 / (1000f64 * 1000f64));
+                let total_cpu = cxf.number(total_cpu as f64 / (1000f64 * 1000f64));
+                stats.set(&mut cxf, "interrupts", interrupt_count)?;
+                stats.set(&mut cxf, "evalTimeMs", eval_time)?;
+                stats.set(&mut cxf, "cpuTimeMs", total_cpu)?;
+                return_value.set(&mut cxf, 1, stats)?;
+                return_value.set(&mut cxf, 0, out)?;
+                Ok(return_value)
+            },
+            Err(e) => cxf.throw_error(e)
+        }
+    })
+    .unwrap();
+
+    return_obj.set(&mut cx, "evalSync", eval_sync_fn).unwrap();
+
+    let closed_clone = is_closed.clone();
+    let to_byte_code = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+        if *closed_clone.lock().unwrap() == true {
+            return cxf.throw_error("Runtime is closed");
+        }
+
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
         let (deferred, promise) = cxf.promise();
 
@@ -473,13 +541,13 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         .set(&mut cx, "getByteCode", to_byte_code)
         .unwrap();
 
-    let closedClone = is_closed.clone();
+    let closed_clone = is_closed.clone();
     let to_byte_code = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        if *closedClone.lock().unwrap() == true {
+        if *closed_clone.lock().unwrap() == true {
             return cxf.throw_error("Runtime is closed");
         }
 
-        let send_fn = QUICKJS_SENDERS.blocking_lock()[channelId].clone();
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let bytes = cxf.argument::<JsUint8Array>(0)?;
         let vec_size = bytes.len(&mut cxf);
         let mut buffer: Vec<u8> = Vec::with_capacity(vec_size);
@@ -515,7 +583,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
-    cx.export_function("QuickJSWorker", create_worker)?;
+    cx.export_function("QJSWorker", create_worker)?;
 
     Ok(())
 }
