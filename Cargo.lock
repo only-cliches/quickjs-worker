@@ -1309,7 +1309,8 @@ dependencies = [
 [[package]]
 name = "quickjs_runtime"
 version = "0.13.3"
-source = "git+https://github.com/only-cliches/quickjs_es_runtime.git#a3e7d9beb7f436a58bf7b4265b354f4b471f6262"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddb47a0abcbd3e118a833ce3191454789b54b3d0e0033553505c82c1d8cb2873"
 dependencies = [
  "backtrace",
  "flume",

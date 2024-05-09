@@ -15,8 +15,7 @@ crate-type = ["cdylib"]
 [dependencies]
 lazy_static = "1.4.0"
 neon = { version = "1", features = ["futures"] }
-#quickjs_runtime = { version = "0.13.3", features = ["setimmediate", "setinterval", "settimeout"] }
-quickjs_runtime = { git = "https://github.com/only-cliches/quickjs_es_runtime.git", features = ["setimmediate", "setinterval", "settimeout"] }
+quickjs_runtime = { version = "0.13.3", features = ["setimmediate", "setinterval", "settimeout"] }
 tokio = { version = "1.37.0", features = ["full"] }
 log = "0.4"
 env_logger = "0.9"

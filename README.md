@@ -10,10 +10,10 @@ import { QJSWorker } from "quickjs-worker";
 
 const runtime = QJSWorker({
     console: {
-        log: (..args) => {
+        log: (...args) => {
             // capture console.log commands from the runtime
         }
-    }
+    },
     // or just provide Node console to pass them through
     // console: console,
     maxEvalMs: 1500, // limit execution time of each eval call
@@ -43,17 +43,17 @@ runtime.postMessage({key: "value"})
 
     const [evalResult, evalStats] = await runtime.eval("2 + 2");
     console.assert(evalResult == 4);
-    const [evalResult, evalStats] = await runtime.eval("addTwo(2, 3)");
-    console.assert(evalResult == 5);
-    const [evalResult, evalStats] = await runtime.eval("json_value.state");
-    console.assert(evalResult == "Texas");
+    const [addTwoResult] = await runtime.eval("addTwo(2, 3)");
+    console.assert(addTwoResult == 5);
+    const [jsonValue] = await runtime.eval("json_value.state");
+    console.assert(jsonValue == "Texas");
 
     // Promises are resolved before returning the internal value.
-    const [evalResult, evalStats] = await runtime.eval("Promise.resolve({hello: 'world'})");
-    console.assert(evalResult.hello == "world");
+    const [promise] = await runtime.eval("Promise.resolve({hello: 'world'})");
+    console.assert(promise.hello == "world");
     // even nested promises are resolved
-    const [evalResult, evalStats] = await runtime.eval("Promise.resolve(Promise.resolve({hello: 'world'}))");
-    console.assert(evalResult.hello == "world"); 
+    const [nestedPromise] = await runtime.eval("Promise.resolve(Promise.resolve({hello: 'world'}))");
+    console.assert(nestedPromise.hello == "world"); 
 
     // message passing
     await runtime.eval(`on('message', (msg) => { /* handle message */ })`);
@@ -69,19 +69,17 @@ runtime.postMessage({key: "value"})
     const byteCode = await runtime.getByteCode(`const test = (a, b) => Promise.resolve(a+b)`);
     const runtime2 = QJSWorker();
     await runtime2.loadByteCode(byteCode);
-    const [evalResult, evalStats] = await runtime2.eval(`test(1, 2)`);
-    console.assert(evalResult == 3);
+    const [byteCodeFnResult] = await runtime2.eval(`test(1, 2)`);
+    console.assert(byteCodeFnResult == 3);
 
 
     // make sure to close your runtimes or the node process will hang
     await runtime.close();
     await runtime2.close();
 })()
-
-
 ```
 
 Current major limitations:
 - Alpha software, don't have any tests in place yet.
 - Would like to support async functions in staticGlobals at some point.
-- Does not support es6 modules `import` or `export` syntax.  
+- Does not support es6 modules `import` or `export` syntax in the runtime.
