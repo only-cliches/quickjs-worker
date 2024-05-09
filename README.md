@@ -80,3 +80,8 @@ runtime.postMessage({key: "value"})
 
 
 ```
+
+Current major limitations:
+- Alpha software, don't have any tests in place yet.
+- Would like to support async functions in staticGlobals at some point.
+- Does not support es6 modules `import` or `export` syntax.  
