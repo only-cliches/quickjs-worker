@@ -56,7 +56,7 @@ runtime.postMessage({key: "value"})
     console.assert(evalResult.hello == "world"); 
 
     // message passing
-    await runtime.eval(`on('message' (msg) => { /* handle message */ })`);
+    await runtime.eval(`on('message', (msg) => { /* handle message */ })`);
     // send messages to Node
     await runtime.eval(`postMessage(["never", "gonna", "give"])`);
 

@@ -10,7 +10,7 @@ export type Primitive = string | number | boolean;
 /**
  * Create a new QuickJS runtime in it's own thread
  */
-export const QuickJSWorker: (args?: {
+export const QJSWorker: (args?: {
     /** Capture console commands from the runtime */
     console?: {
         log: (...values: any) => any,

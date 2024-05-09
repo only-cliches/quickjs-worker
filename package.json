@@ -1,6 +1,6 @@
 {
   "name": "quickjs-worker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run a QuickJS worker from NodeJS",
   "main": "index.node",
   "types": "index.d.ts",
