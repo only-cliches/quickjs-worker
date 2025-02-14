@@ -1,13 +1,11 @@
 {
   "name": "quickjs-vm",
-  "version": "0.1.5",
+  "version": "0.1.7",
   "description": "Run a QuickJS worker from NodeJS",
   "main": "index.js",
   "types": "index.d.ts",
   "scripts": {
-    "build": "cargo-cp-artifact -nc index.node -- cargo build --message-format=json-render-diagnostics",
-    "build-debug": "npm run build --",
-    "build-release": "npm run build -- --release",
+    "build": "cargo-cp-artifact -nc index.node -- cargo build --release --message-format=json-render-diagnostics",
     "install": "npm run build-release",
     "test": "cargo test"
   },

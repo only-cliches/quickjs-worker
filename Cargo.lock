@@ -1488,7 +1488,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quickjs-worker"
+name = "quickjs-vm"
 version = "0.1.4"
 dependencies = [
  "cpu-time",

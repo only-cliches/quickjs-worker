@@ -5,6 +5,8 @@
 
 A **QuickJS** runtime wrapper for **Node.js** that allows you to run untrusted ES6 code in a secure, sandboxed environment. Doesn't use WASM, compiles to a native module with Rust.
 
+Installation of the [Rust Programming Language](https://www.rust-lang.org/tools/install) is required to use this module.
+
 Features include:
 
 - **Safely evaluate** untrusted Javascript (supports most of ES2023).
