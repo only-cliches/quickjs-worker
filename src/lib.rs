@@ -275,7 +275,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 }
             }
 
-            if let Ok(value) = args_obj.get_value(&mut cx, "staticGlobals") {
+            if let Ok(value) = args_obj.get_value(&mut cx, "globals") {
                 if let Ok(globals) = value.downcast::<JsObject, _>(&mut cx) {
 
                     let object_keys = cx

@@ -15,34 +15,34 @@ export type PrimtiveObj = {
 
 export type PrimitiveAll = Primitive | PrimtiveObj | PrimitiveArray
 
+// @TODO
+// export type QuickJSHandle<T> = {
+//     /** Investigate the type of the handle */
+//     typeOf(): Promise<string>
 
-export type QuickJSHandle<T> = {
-    /** Investigate the type of the handle */
-    typeOf(): Promise<string>
+//     /** If the JS Handle is an object, get it's keys */
+//     keys(): Promise<string[]>
 
-    /** If the JS Handle is an object, get it's keys */
-    keys(): Promise<string[]>
+//     /** 
+//      * If the JS Handle is an object, get a handle for the following property 
+//      * */
+//     getProperty(key: string): Promise<QuickJSHandle<any>>
 
-    /** 
-     * If the JS Handle is an object, get a handle for the following property 
-     * */
-    getProperty(key: string): Promise<QuickJSHandle<any>>
+//     /** If the JS handle is an object, set the given property of the object to this value. */
+//     setProperty(key: string, value: any): Promise<void>
 
-    /** If the JS handle is an object, set the given property of the object to this value. */
-    setProperty(key: string, value: any): Promise<void>
+//     /** Attempt to convert a handle into a NodeJS value. */
+//     getValue(): Promise<T>
 
-    /** Attempt to convert a handle into a NodeJS value. */
-    getValue(): Promise<T>
+//     /** Call a handle as a function. */
+//     call<X>(thisArg: any, ...args: any): Promise<X>
 
-    /** Call a handle as a function. */
-    call<X>(thisArg: any, ...args: any): Promise<X>
+//     /** You must close handles or they won't get GCd */
+//     close(): Promise<void>
 
-    /** You must close handles or they won't get GCd */
-    close(): Promise<void>
-
-    /** Set the value of the handle */
-    setValue(data: T): Promise<void>
-}
+//     /** Set the value of the handle */
+//     setValue(data: T): Promise<void>
+// }
 
 /**
  * Create a new QuickJS runtime in it's own thread

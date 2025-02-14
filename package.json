@@ -1,5 +1,5 @@
 {
-  "name": "quickjs-worker",
+  "name": "quickjs-vm",
   "version": "0.1.4",
   "description": "Run a QuickJS worker from NodeJS",
   "main": "index.js",
@@ -11,6 +11,25 @@
     "install": "npm run build-release",
     "test": "cargo test"
   },
+  "keywords": [
+    "quickjs",
+    "vm",
+    "sandbox",
+    "nodejs",
+    "javascript",
+    "es6",
+    "eval",
+    "bytecode",
+    "worker",
+    "secure",
+    "untrusted",
+    "memory-limit",
+    "isolate",
+    "runtime",
+    "async",
+    "synchronous",
+    "promises"
+  ],
   "author": "me@scottlott.com",
   "license": "MIT",
   "dependencies": {
