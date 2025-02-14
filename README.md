@@ -3,7 +3,9 @@
 [![npm version](https://badge.fury.io/js/quickjs-vm.svg)](https://badge.fury.io/js/quickjs-vm)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
-A **QuickJS** runtime wrapper for **Node.js** that allows you to run untrusted ES6 code in a secure, sandboxed environment. Features include:
+A **QuickJS** runtime wrapper for **Node.js** that allows you to run untrusted ES6 code in a secure, sandboxed environment. Doesn't use WASM, compiles to a native module with Rust.
+
+Features include:
 
 - **Safely evaluate** untrusted Javascript (supports most of ES2023).
 - **Worker-like API** and `eval` interface.  
