@@ -3,12 +3,14 @@ use lazy_static::lazy_static;
 use neon::prelude::*;
 use neon::types::Deferred;
 use quickjs_runtime::values::JsValueFacade;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 pub mod qjs;
 pub mod js_data;
+// pub mod handle;
 
 #[derive(Default, Debug)]
 struct NodeConsole {
@@ -20,8 +22,8 @@ struct NodeConsole {
 
 #[derive(Default, Debug)]
 pub struct NodeCallbacks {
-    require: Option<Root<JsFunction>>,
-    normalize: Option<Root<JsFunction>>,
+    // require: Option<Root<JsFunction>>,
+    // normalize: Option<Root<JsFunction>>,
     console: NodeConsole,
 }
 
@@ -44,6 +46,8 @@ lazy_static! {
     static ref INT_COUNTERS: Arc<tokio::sync::Mutex<Vec<(i64, i64)>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     static ref GLOBAL_PTRS: Arc<tokio::sync::Mutex<Vec<Vec<(String, GlobalTypes)>>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    static ref QJS_HANDLES: Arc<tokio::sync::Mutex<Vec<HashMap<String, JsValueFacade>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 }
 
@@ -106,15 +110,23 @@ pub enum QuickChannelMsg {
         def: Deferred,
     },
     EvalScript {
-        script_name: String,
-        target: ScriptEvalType,
-        source: String,
+        target: ScriptEvalType
     },
 }
 
 pub enum ScriptEvalType {
-    Sync { sender: tokio::sync::oneshot::Sender<Result<(JsDataTypes, cpu_time::ProcessTime, Instant), String>> },
-    Async { promise: Deferred }
+    Sync { 
+        script_name: String,
+        source: String,
+        sender: tokio::sync::oneshot::Sender<Result<(JsDataTypes, cpu_time::ProcessTime, Instant), String>>,
+        args: Option<Vec<JsDataTypes>>
+    },
+    Async { 
+        script_name: String,
+        source: String,
+        promise: Deferred,
+        args: Option<Vec<JsDataTypes>>
+    }
 }
 
 
@@ -269,8 +281,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                     let object_keys = cx
                     .global::<JsFunction>("Object")?
                     .get_value(&mut cx, "keys")?
-                    .downcast::<JsFunction, _>(&mut cx)
-                    .unwrap();
+                    .downcast::<JsFunction, _>(&mut cx).unwrap();
 
                     let keys = object_keys
                         .call_with(&mut cx)
@@ -308,7 +319,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
     qjs::quickjs_thread(options, channel_id, urx, urx2);
 
-    // set return object for module
+    // create return object for js module
     let return_obj = cx.empty_object();
 
     let is_closed = Arc::new(std::sync::Mutex::new(false));
@@ -444,13 +455,18 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
         let script_name = if let Some(args_obj) = cxf.argument_opt(1) { 
             args_obj.downcast_or_throw::<JsString, _>(&mut cxf)?.value(&mut cxf)
-        } else { String::from("./") };
+        } else { String::from("Unnamed Script") };
+
+        let mut args: Vec<JsDataTypes> = Vec::new();
+        for i in 0..30 {
+            if let Some(arg_value) = cxf.argument_opt(i + 2) {
+                args.push(JsDataTypes::from_node_value(arg_value, &mut cxf)?);
+            }
+        }
 
         send_fn
             .blocking_send(QuickChannelMsg::EvalScript {
-                script_name,
-                source: String::from(script),
-                target: ScriptEvalType::Async { promise: deferred }
+                target: ScriptEvalType::Async { promise: deferred, source: String::from(script), script_name, args: if args.len() > 0 { Some(args) } else { None } }
             })
             .unwrap_or(());
 
@@ -473,12 +489,17 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             args_obj.downcast_or_throw::<JsString, _>(&mut cxf)?.value(&mut cxf)
         } else { String::from("./") };
 
+        let mut args: Vec<JsDataTypes> = Vec::new();
+        for i in 0..30 {
+            if let Some(arg_value) = cxf.argument_opt(i + 2) {
+                args.push(JsDataTypes::from_node_value(arg_value, &mut cxf)?);
+            }
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         send_fn
             .blocking_send(QuickChannelMsg::EvalScript {
-                script_name,
-                source: String::from(script),
-                target: ScriptEvalType::Sync { sender: tx }
+                target: ScriptEvalType::Sync { sender: tx, script_name, source: String::from(script), args: if args.len() > 0 { Some(args) } else { None } }
             })
             .unwrap();
 
@@ -543,7 +564,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
     let closed_clone = is_closed.clone();
     let to_byte_code = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-        if *closed_clone.lock().unwrap() == true {
+        if *closed_clone.clone().lock().unwrap() == true {
             return cxf.throw_error("Runtime is closed");
         }
 
@@ -571,12 +592,84 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             .unwrap();
 
         return Ok(promise);
-    })
-    .unwrap();
+    }).unwrap();
 
     return_obj
-        .set(&mut cx, "loadByteCode", to_byte_code)
-        .unwrap();
+        .set(&mut cx, "loadByteCode", to_byte_code)?;
+
+    // Handle Object
+    // let handle_obj = JsObject::new(&mut cx);
+
+    // let eval_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+
+    // })?;
+
+    // handle::create_handle(&mut cxf, channel_id, handle::HandleType::Eval);
+
+    // handle_obj.set(&mut cx, "eval", eval_fn)?;
+
+    // let eval_fn_sync = JsFunction::new(&mut cx, |mut cxf: FunctionContext| {
+
+    //     handle::create_handle(&mut cxf, channel_id, handle::HandleType::EvalSync)
+    // })?;
+
+    // handle_obj.set(&mut cx, "evalSync", eval_fn_sync)?;
+
+    // let closed_clone = is_closed.clone();
+    // let create_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+    //     if *closed_clone.lock().unwrap() == true {
+    //         return cxf.throw_error("Runtime is closed");
+    //     }
+
+    //     let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
+    //     let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
+
+    //     let script_name = String::from("qjs-worker: create_handle.js");
+
+    //     let (tx, rx) = tokio::sync::oneshot::channel();
+    //     send_fn
+    //         .blocking_send(QuickChannelMsg::EvalScript {
+    //             target: ScriptEvalType::Sync { sender: tx, script_name, source: String::from(script), args: None }
+    //         })
+    //         .unwrap();
+
+    //     let result = rx.blocking_recv().unwrap();
+
+    //     match result {
+    //         Ok((data, cpu_time, start_time)) => {
+
+    //             let return_value = cxf.empty_array();
+    //             let stats = cxf.empty_object();
+    //             let int_counters = INT_COUNTERS.blocking_lock();
+
+    //             let out = data.to_node_value(&mut cxf)?;
+                
+    //             let interrupt_count = if int_counters[channel_id].0 > 0 {
+    //                 cxf.number(int_counters[channel_id].1 as f64)
+    //             } else {
+    //                 cxf.number(-1)
+    //             };
+    //             let total_cpu = cpu_time.elapsed().as_nanos();
+    //             let eval_time =
+    //                 cxf.number(start_time.elapsed().as_nanos() as f64 / (1000f64 * 1000f64));
+    //             let total_cpu = cxf.number(total_cpu as f64 / (1000f64 * 1000f64));
+    //             stats.set(&mut cxf, "interrupts", interrupt_count)?;
+    //             stats.set(&mut cxf, "evalTimeMs", eval_time)?;
+    //             stats.set(&mut cxf, "cpuTimeMs", total_cpu)?;
+    //             return_value.set(&mut cxf, 1, stats)?;
+    //             return_value.set(&mut cxf, 0, out)?;
+    //             Ok(return_value)
+    //         },
+    //         Err(e) => cxf.throw_error(e)
+    //     }
+        
+    // }).unwrap();
+    // handle_obj.set(&mut cx, "create", create_fn)?;
+
+    // return_obj
+    // .set(&mut cx, "handle", handle_obj)
+    // .unwrap();
+
 
     Ok(return_obj)
 }

@@ -27,26 +27,55 @@ const runtime = QJSWorker({
         addTwo: (a, b) => a + b,
         json_value: {
             state: "Texas"
+        },
+        array_value: [
+            {nested: "object"},
+            {foo: "bar"}
+        ],
+        // handle require() calls
+        require: (moduleName: string) => {
+            /* ... */
         }
     }
 });
 
 
-runtime.on("message", (msg) => {
-    // handle messages from the runtime
-})
 
-// send a message to the runtime, supports primitves, JSON and Arrays.
-runtime.postMessage({key: "value"})
 
 (async () => {
 
     const [evalResult, evalStats] = await runtime.eval("2 + 2");
     console.assert(evalResult == 4);
+    const [evalResultSync] = runtime.evalSync("2 + 3");
+    console.assert(evalResultSync == 5);
+
     const [addTwoResult] = await runtime.eval("addTwo(2, 3)");
     console.assert(addTwoResult == 5);
+
+    // args can be passed directly
+    const [addTwoResultWithArgs] = await runtime.eval("addTwo", "script_name.js", 6, 6);
+    console.assert(addTwoResultWithArgs == 12);
+
+    // return nested properties
     const [jsonValue] = await runtime.eval("json_value.state");
     console.assert(jsonValue == "Texas");
+
+    // send a message to node from quickjs. Supports primitves, JSON and Arrays.
+    let recievedMessage;
+    runtime.on("message", (msg) => {
+        recievedMessage = msg;
+    })
+    await runtime.eval(`postMessage({hello: "from QuickJS"})`)
+    console.assert(recievedMessage.hello = "from QuickJS");
+
+    // send a message to quickjs from node. Supports primitves, JSON and Arrays.
+    await runtime.eval(`
+        let messageFromNode;
+        on('message', (msg) => { messageFromNode = msg; })
+    `)
+    await runtime.postMessage({hello: "from Node"})
+    const [message] = await runtime.eval('messageFromNode');
+    console.assert(message.hello == "from Node");
 
     // Promises are resolved before returning the internal value.
     const [promise] = await runtime.eval("Promise.resolve({hello: 'world'})");
@@ -54,11 +83,6 @@ runtime.postMessage({key: "value"})
     // even nested promises are resolved
     const [nestedPromise] = await runtime.eval("Promise.resolve(Promise.resolve({hello: 'world'}))");
     console.assert(nestedPromise.hello == "world"); 
-
-    // message passing
-    await runtime.eval(`on('message', (msg) => { /* handle message */ })`);
-    // send messages to Node
-    await runtime.eval(`postMessage(["never", "gonna", "give"])`);
 
     // get memory stats
     const memStatus = await runtime.memory();
@@ -72,7 +96,6 @@ runtime.postMessage({key: "value"})
     const [byteCodeFnResult] = await runtime2.eval(`test(1, 2)`);
     console.assert(byteCodeFnResult == 3);
 
-
     // make sure to close your runtimes or the node process will hang
     await runtime.close();
     await runtime2.close();
@@ -80,6 +103,5 @@ runtime.postMessage({key: "value"})
 ```
 
 Current major limitations:
-- Alpha software, don't have any tests in place yet.
-- Would like to support async functions in staticGlobals at some point.
+- Would like to support async functions in globals at some point.
 - Does not support es6 modules `import` or `export` syntax in the runtime.

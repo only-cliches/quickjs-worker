@@ -7,6 +7,43 @@ export type EvalStats = {
 
 export type Primitive = string | number | boolean;
 
+export type PrimitiveArray = Array<Primitive | PrimitiveArray | PrimtiveObj>
+
+export type PrimtiveObj = {
+    [key: string]: PrimtiveObj | Primitive | PrimitiveArray
+};
+
+export type PrimitiveAll = Primitive | PrimtiveObj | PrimitiveArray
+
+
+export type QuickJSHandle<T> = {
+    /** Investigate the type of the handle */
+    typeOf(): Promise<string>
+
+    /** If the JS Handle is an object, get it's keys */
+    keys(): Promise<string[]>
+
+    /** 
+     * If the JS Handle is an object, get a handle for the following property 
+     * */
+    getProperty(key: string): Promise<QuickJSHandle<any>>
+
+    /** If the JS handle is an object, set the given property of the object to this value. */
+    setProperty(key: string, value: any): Promise<void>
+
+    /** Attempt to convert a handle into a NodeJS value. */
+    getValue(): Promise<T>
+
+    /** Call a handle as a function. */
+    call<X>(thisArg: any, ...args: any): Promise<X>
+
+    /** You must close handles or they won't get GCd */
+    close(): Promise<void>
+
+    /** Set the value of the handle */
+    setValue(data: T): Promise<void>
+}
+
 /**
  * Create a new QuickJS runtime in it's own thread
  */
@@ -39,14 +76,18 @@ export const QJSWorker: (args?: {
      * Prevents while(true) loops, more interrupts allow more code exection.  Default is unlimited.
      */
     maxInterrupt?: number,
-    /** How many allocations can the runtime do before the GC runs? */
+    /** How many allocations can the runtime do before the Garbage collector automatically runs? */
     gcThresholdAlloc?: number,
-    /** Automatically run the GC at regular intervals */
+    /** Automatically run the Garbage Collector at regular intervals */
     gcIntervalMs?: number,
-    /** Provide static callbacks and primitives to the runtime */
-    staticGlobals?: {
+    /** Provide callbacks and primitives to the runtime 
+     * 
+     * 
+    */
+    globals?: {
         [key: string]: Primitive | Date | Array<Primitive> | {[key: string]: Primitive} | ((arg: any) => any)
     }
+    // @TODO: these do not work (yet)
     // imports: (moduleName) => {
     //     console.log('IMPORTS', moduleName);
     //     return "export default ({})";
@@ -60,9 +101,19 @@ export const QJSWorker: (args?: {
      * Primitives, JSON and Arrays can returned across the eval barrier without an issue.
      * There is a serialization/deserialization cost when returning Arrays and JSON.
      * 
+     * Unlike evalSync, this method is non blocking and runs the vm script in a seperate thread.
+     *
      * */
-    eval: <T>(jsSourceCode: string, scriptName?: string) => Promise<[T, EvalStats]>,
-    evalSync: <T>(jsSourceCode: string, scriptName?: string) => [T, EvalStats]
+    eval: <T>(jsSourceCode: string, scriptName?: string, ...args: any) => Promise<[T, EvalStats]>,
+    /** 
+     * Evaluate Javascript code in the virtual machine, will recursively resolve promises that are returned from .eval and .evalSync.
+     * Primitives, JSON and Arrays can returned across the eval barrier without an issue.
+     * There is a serialization/deserialization cost when returning Arrays and JSON.
+     * 
+     * This method blocks the NodeJS thread until the vm script completes, then returns the value.
+     *
+     * */
+    evalSync: <T>(jsSourceCode: string, scriptName?: string, ...args: any) => [T, EvalStats]
     /** Handle postMessage() events from the virtual machine */
     on: (type: "message" | "close", callback: (event: any) => void) => void
     /** Convert a block of source code into QuickJS ByteCode */
@@ -76,6 +127,7 @@ export const QJSWorker: (args?: {
         realm_ct: number,
         malloc_size: number,
         malloc_limit: number,
+        /** Number of bytes being used by VM Memory */
         memory_used_size: number,
         malloc_count: number,
         memory_used_count: number,
@@ -114,5 +166,15 @@ export const QJSWorker: (args?: {
      * Primitives, JSON and Arrays can sent to the runtime using this function.
      * There is a serialization/deserialization cost when sending Arrays and JSON.
      * */
-    postMessage: (message: any) => void
+    postMessage: (message: any) => void,
+    /** Functions for creating handles onto objects in the QuickJS Runtime */
+    // @TODO
+    // handle: {
+    //     /** Eval source code into a handle. */
+    //     eval: <T>(sourceCode: string, scriptName?: string) => Promise<QuickJSHandle<T>>,
+    //     /** Eval source code into a handle. */
+    //     evalSync: <T>(sourceCode: string, scriptName?: string) => QuickJSHandle<T>,
+    //     /** Create a handle from a NodeJS Value */
+    //     create: <T>(value: T) => QuickJSHandle<T>
+    // }
 }

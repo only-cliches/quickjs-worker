@@ -1,5 +1,5 @@
 use neon::prelude::*;
-use quickjs_runtime::builder::QuickJsRuntimeBuilder;
+use quickjs_runtime::{builder::QuickJsRuntimeBuilder, jsutils::JsError};
 use quickjs_runtime::facades::QuickJsRuntimeFacade;
 use quickjs_runtime::jsutils::Script;
 use quickjs_runtime::quickjsrealmadapter::QuickJsRealmAdapter;
@@ -69,73 +69,73 @@ macro_rules! quick_js_console {
     };
 }
 
-struct CustomModuleLoader {}
+// struct CustomModuleLoader {}
 
-impl quickjs_runtime::jsutils::modules::ScriptModuleLoader for CustomModuleLoader {
-    fn normalize_path(
-        &self,
-        realm: &QuickJsRealmAdapter,
-        ref_path: &str,
-        path: &str,
-    ) -> Option<String> {
-        let channel_id = realm.id.parse::<usize>().unwrap();
-        let unlocked = NODE_CHANNELS.blocking_lock();
-        let path_str = String::from(path);
-        let ref_str = String::from(ref_path);
+// impl quickjs_runtime::jsutils::modules::ScriptModuleLoader for CustomModuleLoader {
+//     fn normalize_path(
+//         &self,
+//         realm: &QuickJsRealmAdapter,
+//         ref_path: &str,
+//         path: &str,
+//     ) -> Option<String> {
+//         let channel_id = realm.id.parse::<usize>().unwrap();
+//         let unlocked = NODE_CHANNELS.blocking_lock();
+//         let path_str = String::from(path);
+//         let ref_str = String::from(ref_path);
 
-        if let Some(channel) = unlocked[channel_id].clone() {
-            return channel
-                .send(move |mut cx| {
-                    let callbacks = NODE_CALLBACKS.blocking_lock();
-                    if let Some(require) = &callbacks[channel_id].normalize {
-                        let normalize_fn = require.to_inner(&mut cx);
-                        let normalize_call = normalize_fn
-                            .call_with(&mut cx)
-                            .arg(cx.string(ref_str))
-                            .arg(cx.string(path_str))
-                            .apply::<JsString, _>(&mut cx);
+//         if let Some(channel) = unlocked[channel_id].clone() {
+//             return channel
+//                 .send(move |mut cx| {
+//                     let callbacks = NODE_CALLBACKS.blocking_lock();
+//                     if let Some(require) = &callbacks[channel_id].normalize {
+//                         let normalize_fn = require.to_inner(&mut cx);
+//                         let normalize_call = normalize_fn
+//                             .call_with(&mut cx)
+//                             .arg(cx.string(ref_str))
+//                             .arg(cx.string(path_str))
+//                             .apply::<JsString, _>(&mut cx);
 
-                        if let Ok(resolve_path) = normalize_call {
-                            return Ok(resolve_path.value(&mut cx));
-                        }
-                    }
+//                         if let Ok(resolve_path) = normalize_call {
+//                             return Ok(resolve_path.value(&mut cx));
+//                         }
+//                     }
 
-                    return cx.throw_error("");
-                })
-                .join()
-                .ok();
-        }
+//                     return cx.throw_error("");
+//                 })
+//                 .join()
+//                 .ok();
+//         }
 
-        Some(String::from(path))
-    }
+//         Some(String::from(path))
+//     }
 
-    fn load_module(&self, realm: &QuickJsRealmAdapter, absolute_path: &str) -> String {
-        let channel_id = realm.id.parse::<usize>().unwrap();
-        let unlocked = NODE_CHANNELS.blocking_lock();
-        let path_str = String::from(absolute_path);
+//     fn load_module(&self, realm: &QuickJsRealmAdapter, absolute_path: &str) -> String {
+//         let channel_id = realm.id.parse::<usize>().unwrap();
+//         let unlocked = NODE_CHANNELS.blocking_lock();
+//         let path_str = String::from(absolute_path);
 
-        if let Some(channel) = unlocked[channel_id].clone() {
-            return channel
-                .send(move |mut cx| {
-                    let callbacks = NODE_CALLBACKS.blocking_lock();
-                    if let Some(require) = &callbacks[channel_id].require {
-                        let require_fn = require.to_inner(&mut cx);
-                        let path_string = cx.string(path_str.as_str());
-                        let module_src = require_fn
-                            .call_with(&mut cx)
-                            .arg(path_string)
-                            .apply::<JsString, _>(&mut cx)?;
-                        return Ok(module_src.value(&mut cx));
-                    }
-                    Ok(String::from("export default ({});"))
-                })
-                .join()
-                .unwrap();
-        }
+//         if let Some(channel) = unlocked[channel_id].clone() {
+//             return channel
+//                 .send(move |mut cx| {
+//                     let callbacks = NODE_CALLBACKS.blocking_lock();
+//                     if let Some(require) = &callbacks[channel_id].require {
+//                         let require_fn = require.to_inner(&mut cx);
+//                         let path_string = cx.string(path_str.as_str());
+//                         let module_src = require_fn
+//                             .call_with(&mut cx)
+//                             .arg(path_string)
+//                             .apply::<JsString, _>(&mut cx)?;
+//                         return Ok(module_src.value(&mut cx));
+//                     }
+//                     Ok(String::from("export default ({});"))
+//                 })
+//                 .join()
+//                 .unwrap();
+//         }
 
-        String::from("export default ({});")
-    }
-}
+//         String::from("export default ({});")
+//     }
+// }
 
 
 fn is_valid_js_variable(s: &str) -> bool {
@@ -812,10 +812,13 @@ pub fn quickjs_thread(
 
                                             //  Ok(JsDataTypes::Unknown)
                                             })
-                                            .join()
-                                            .unwrap();
+                                            .join();
 
-                                        return Ok(result_type.to_quick_value(realm).unwrap())
+
+                                        return match result_type {
+                                            Ok(result) => Ok(result.to_quick_value(realm).unwrap()),
+                                            Err(e) => Err(JsError::new(String::from("Join Error"), e.to_string(), String::from("")))
+                                        }
                                     }
 
 
@@ -838,7 +841,7 @@ pub fn quickjs_thread(
                                             "#).as_str());
                                         },
                                         GlobalTypes::Function { value: _ } => {
-                                            let fn_call = std::format!("(...args) => __INTERNAL_CALL_GLOBAL({i}, args);");
+                                            let fn_call = std::format!("function(...args) {{ return __INTERNAL_CALL_GLOBAL({i}, args) }};");
                                             init_global_fn.push_str(std::format!(r#"
                                                 const {key} = {fn_call};
                                             "#).as_str());
@@ -977,7 +980,7 @@ pub fn quickjs_thread(
                             let mut unlocked = cbs.lock().await;
                             unlocked.push((root, on));
                         },
-                        QuickChannelMsg::EvalScript { source, target, script_name } => {
+                        QuickChannelMsg::EvalScript { target } => {
                             {
                                 // reset inturupt counter
                                 let mut int_counters = INT_COUNTERS.lock().await;
@@ -985,14 +988,36 @@ pub fn quickjs_thread(
                             }
                             
                             let rt_id = realm_id_clone.clone();
-                            let script_future = rt_clone.lock().await.loop_async(move |runtime| {
+
+                            let script = match &target {
+                                ScriptEvalType::Sync { script_name, source, sender: _ , args } => Some((Script::new(&script_name, source), args.clone())),
+                                ScriptEvalType::Async { script_name, source, promise: _, args } => Some((Script::new(&script_name, source), args.clone()))
+                            };
+
+                            let script_future = rt_clone.lock().await.loop_async( move |runtime| {
                                 let realm = runtime.get_realm(&rt_id).unwrap();
-                                
-                                match realm.eval(Script::new(script_name.as_str(), &source)) {
-                                    Ok(eval_result) => {
-                                        return realm.to_js_value_facade(&eval_result);
+                                if let Some((use_script, args)) = script {
+                                    match realm.eval(use_script) {
+                                        Ok(eval_result) => {
+                                            if eval_result.is_function() {
+                                                let use_args = if let Some(args) = args {
+                                                    args.iter().map(|x| x.to_quick_value(realm).unwrap()).collect()
+                                                } else { Vec::new() }; 
+                                                let result = realm.invoke_function(None, &eval_result, &use_args.iter().collect::<Vec<&QuickJsValueAdapter>>().as_slice())?;
+                                                return realm.to_js_value_facade(&result);
+                                            } else {
+                                                return realm.to_js_value_facade(&eval_result);
+                                            }
+                                        }
+                                        Err(e) => return Err(e),
                                     }
-                                    Err(e) => return Err(e),
+                                } else {
+                                    match realm.eval(Script::new(".", "undefined")) {
+                                        Ok(eval_result) => {
+                                            return realm.to_js_value_facade(&eval_result);
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
                                 }
                             });
 
@@ -1011,10 +1036,10 @@ pub fn quickjs_thread(
                                 {
                                     Err(e) => {
                                         match target {
-                                            ScriptEvalType::Sync { sender } => {
+                                            ScriptEvalType::Sync { sender, script_name: _, source: _, args: _ } => {
                                                 sender.send(Err(e.to_string())).unwrap_or(());
                                             },
-                                            ScriptEvalType::Async { promise }  => {
+                                            ScriptEvalType::Async { promise, script_name: _, source: _, args: _ }  => {
                                                 let sync_channel = SYNC_SENDERS.lock().await;
                                                 sync_channel[channel_id].send(SyncChannelMsg::SendError { e: e.to_string(), def: promise }).await.unwrap();
                                             }
@@ -1031,7 +1056,7 @@ pub fn quickjs_thread(
                                         )
                                         .await;
                                         match target {
-                                            ScriptEvalType::Sync { sender } => {
+                                            ScriptEvalType::Sync { sender, script_name: _, source: _, args: _ } => {
                                                 match out {
                                                     Ok(data) => {
                                                         sender.send(Ok((data, start_cpu, start_time))).unwrap();
@@ -1041,7 +1066,7 @@ pub fn quickjs_thread(
                                                     }
                                                 }
                                             },
-                                            ScriptEvalType::Async { promise }  => {
+                                            ScriptEvalType::Async { promise, script_name: _, source: _, args: _ }  => {
                                                 let sync_channel = SYNC_SENDERS.lock().await;
                                                 match out {
                                                     Ok(data) => {
@@ -1069,7 +1094,7 @@ pub fn quickjs_thread(
                                 .await;
 
                                 match target {
-                                    ScriptEvalType::Sync { sender } => {
+                                    ScriptEvalType::Sync { sender, script_name: _, source: _, args: _ } => {
                                         match out {
                                             Ok(data) => {
                                                 sender.send(Ok((data, start_cpu, start_time))).unwrap();
@@ -1079,7 +1104,7 @@ pub fn quickjs_thread(
                                             }
                                         }
                                     },
-                                    ScriptEvalType::Async { promise }  => {
+                                    ScriptEvalType::Async { promise, script_name: _, source: _, args: _ }  => {
                                         let sync_channel = SYNC_SENDERS.lock().await;
                                         match out {
                                             Ok(data) => {
