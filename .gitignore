@@ -130,5 +130,4 @@ dist
 .pnp.*
 
 target
-test.js
 index.node
