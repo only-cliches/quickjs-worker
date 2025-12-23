@@ -1,5 +1,5 @@
 use neon::prelude::*;
-use quickjs_runtime::{builder::QuickJsRuntimeBuilder, jsutils::JsError};
+use quickjs_runtime::{builder::QuickJsRuntimeBuilder};
 use quickjs_runtime::facades::QuickJsRuntimeFacade;
 use quickjs_runtime::jsutils::Script;
 use quickjs_runtime::quickjsrealmadapter::QuickJsRealmAdapter;
@@ -10,10 +10,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use tokio::runtime::Runtime;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{
     GlobalTypes, JsDataTypes, NodeCallbackTypes, QuickChannelMsg, QuickJSOptions, ScriptEvalType, SyncChannelMsg, INT_COUNTERS, NODE_CALLBACKS, NODE_CHANNELS, QUICKJS_CALLBACKS, SYNC_SENDERS
 };
+
+lazy_static::lazy_static! {
+    static ref PENDING_GLOBAL_PROMISES: Arc<tokio::sync::Mutex<HashMap<u32, (JsValueFacade, JsValueFacade)>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    static ref GLOBAL_PROMISE_ID: AtomicU32 = AtomicU32::new(0);
+}
 
 macro_rules! quick_js_console {
     ($key:tt, $func_name:ident) => {
@@ -696,6 +703,28 @@ pub fn quickjs_thread(
                     let msg_cb_clone = msg_cb_clone.clone();
 
                     match message {
+                        QuickChannelMsg::ResolveGlobalPromise { id, result, error } => {
+                            let rt_id = realm_id_clone.clone();
+                            rt_clone.lock().await.loop_async(move |runtime| {
+                                let realm = runtime.get_realm(&rt_id).unwrap();
+                                
+                                let mut resolvers = crate::qjs::PENDING_GLOBAL_PROMISES.blocking_lock();
+                                
+                                if let Some((res, rej)) = resolvers.remove(&id) {
+                                    let res_handle = realm.from_js_value_facade(res)?;
+                                    let rej_handle = realm.from_js_value_facade(rej)?;
+
+                                    if let Some(err_msg) = error {
+                                        let err_val = realm.create_string(&err_msg)?;
+                                        realm.invoke_function(None, &rej_handle, &[&err_val])?;
+                                    } else {
+                                        let val = result.to_quick_value(realm)?;
+                                        realm.invoke_function(None, &res_handle, &[&val])?;
+                                    }
+                                }
+                                Ok::<_, quickjs_runtime::jsutils::JsError>(())
+                            }).await.unwrap();
+                        },
                         QuickChannelMsg::InitGlobals => {
 
                             let globals = crate::GLOBAL_PTRS.lock().await;
@@ -709,11 +738,9 @@ pub fn quickjs_thread(
                                 // let rId = realmIdClone
                                 let realm = runtime.get_realm(&rt_id).unwrap();
 
-                                realm.install_function(&[], "__INTERNAL_CALL_GLOBAL", |_runtime, realm, _this, args| {
+                            realm.install_function(&[], "__INTERNAL_CALL_GLOBAL", |_runtime, realm, _this, args| {
                                     let channel_id = realm.id.parse::<usize>().unwrap();
-
                                     let callback_id = args[0].to_i32() as usize;
-
                                     let callbacks_args_length = realm.get_array_length(&args[1])?;
 
                                     let mut js_args: Vec<JsDataTypes> = Vec::new();
@@ -722,107 +749,106 @@ pub fn quickjs_thread(
                                         js_args.push(JsDataTypes::from_quick_value(&realm.get_array_element(&args[1], i)?, realm)?);
                                     }
 
+                                    // --- FIX START: Create Promise via JS to expose resolve/reject ---
+                                    let deferred_script = Script::new(
+                                        "create_deferred", 
+                                        "(() => { let m; const p = new Promise((res, rej) => { m = { res, rej }; }); return { p, res: m.res, rej: m.rej }; })()"
+                                    );
+                                    let deferred_obj = realm.eval(deferred_script)?;
+                                    
+                                    let promise = realm.get_object_property(&deferred_obj, "p")?;
+                                    let resolve_func = realm.get_object_property(&deferred_obj, "res")?;
+                                    let reject_func = realm.get_object_property(&deferred_obj, "rej")?;
+
+                                    let req_id = crate::qjs::GLOBAL_PROMISE_ID.fetch_add(1, Ordering::Relaxed);
+
+                                    // Store the resolve/reject functions as Facades
+                                    {
+                                        let mut promises = crate::qjs::PENDING_GLOBAL_PROMISES.blocking_lock();
+                                        let res_facade = realm.to_js_value_facade(&resolve_func)?;
+                                        let rej_facade = realm.to_js_value_facade(&reject_func)?;
+                                        promises.insert(req_id, (res_facade, rej_facade));
+                                    }
+                                    // --- FIX END ---
+
                                     let unlocked = NODE_CHANNELS.blocking_lock();
 
                                     if let Some(channel) = &unlocked[channel_id] {
-                                        let result_type = channel
-                                            .send(move |mut cx| {
+                                        let quick_sender = crate::QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
+                                        
+                                        channel.send(move |mut cx| {
 
-                                                let globals = crate::GLOBAL_PTRS.blocking_lock();
-                                                let (_, value) = &globals[channel_id][callback_id];
+                                            let globals = crate::GLOBAL_PTRS.blocking_lock();
+                                            let (_, value) = &globals[channel_id][callback_id];
 
-                                                match value {
-                                                    GlobalTypes::Function { value } => {
-                                                        let mut fn_handle = value.to_inner(&mut cx).call_with(&mut cx);
-                                                        for arg in js_args.iter() {
-                                                            fn_handle.arg(arg.to_node_value(&mut cx)?);
-                                                        }
-                                                        let result = fn_handle.apply::<JsValue, _>(&mut cx)?;
-                                                        
-                                                        // TODO: Handle functions that return a promise
-                                                        // if result.is_a::<JsPromise, _>(&mut cx) {
-                                                        //     let promise = result.downcast::<JsPromise, _>(&mut cx).unwrap();
-                                                            
-                                                        //     // let future = promise.to_future(&mut cx, |mut cxf, result| {
-                                                        //     //     let value = result.unwrap();
-                                                        //     //     if value.is_a::<neon::types::JsDate, _>(&mut cxf) {
-                                                        //     //         let msg = value
-                                                        //     //             .downcast::<neon::types::JsDate, _>(&mut cxf)
-                                                        //     //             .unwrap()
-                                                        //     //             .value(&mut cxf);
-                                                        //     //         return Ok(JsDataTypes::Date { msg })
-                                                        //     //     } else if value.is_a::<JsString, _>(&mut cxf) {
-                                                        //     //         let msg = value
-                                                        //     //             .downcast::<JsString, _>(&mut cxf)
-                                                        //     //             .unwrap()
-                                                        //     //             .value(&mut cxf);
-                                                        //     //         return Ok(JsDataTypes::String { msg })
-                                                        //     //     } else if value.is_a::<JsObject, _>(&mut cxf) || value.is_a::<JsArray, _>(&mut cxf) {
-                                                        //     //         let json_stringify = &mut cxf
-                                                        //     //             .global::<JsObject>("JSON")?
-                                                        //     //             .get_value(&mut cxf, "stringify")?
-                                                        //     //             .downcast::<JsFunction, _>(&mut cxf)
-                                                        //     //             .unwrap();
-                                                        //     //         let msg = json_stringify
-                                                        //     //             .call_with(&mut cxf)
-                                                        //     //             .arg(value)
-                                                        //     //             .apply::<JsString, _>(&mut cxf)?
-                                                        //     //             .value(&mut cxf);
-                                                        //     //         return Ok(JsDataTypes::Json { msg })
-                                                        //     //     } else if value.is_a::<JsNumber, _>(&mut cxf) {
-                                                        //     //         let msg = value
-                                                        //     //             .downcast::<JsNumber, _>(&mut cxf)
-                                                        //     //             .unwrap()
-                                                        //     //             .value(&mut cxf);
-                                                        //     //         return Ok(JsDataTypes::Number { msg })
-                                                        //     //     } else if value.is_a::<JsBoolean, _>(&mut cxf) {
-                                                        //     //         let msg = value
-                                                        //     //             .downcast::<JsBoolean, _>(&mut cxf)
-                                                        //     //             .unwrap()
-                                                        //     //             .value(&mut cxf);
-                                                        //     //         return Ok(JsDataTypes::Boolean { msg })
-                                                        //     //     } else if value.is_a::<JsUndefined, _>(&mut cxf) {
-                                                        //     //         return Ok(JsDataTypes::Undefined)
-                                                        //     //     } else if value.is_a::<JsNull, _>(&mut cxf) {
-                                                        //     //         return Ok(JsDataTypes::Null)
-                                                        //     //     } else {
-                                                        //     //         return Ok(JsDataTypes::Unknown);
-                                                        //     //     };
-                                                        //     // }).unwrap();
-
-                                                            
-                                                        //     // let sync_channel = SYNC_SENDERS.blocking_lock();
-                                                        //     // let (tx, rx) = tokio::sync::oneshot::channel();
-                                                        //     // sync_channel[channel_id].blocking_send(SyncChannelMsg::ProcessAsync { future, tx }).unwrap();
-                                                        //     // let result = rx.blocking_recv().unwrap();
-                                                        //     // println!("PROMISE");
-
-                                                        //     return Ok(JsDataTypes::NodePromise { root: promise.root(&mut cx) });
-                                                        // }
-
-                                                        let data_type = JsDataTypes::from_node_value(result, &mut cx)?;
-
-                                                        return Ok(data_type);
-                                                    },
-                                                    GlobalTypes::Data { value } => {
-                                                        return Ok(value.clone());
+                                            match value {
+                                                GlobalTypes::Function { value } => {
+                                                    let mut fn_handle = value.to_inner(&mut cx).call_with(&mut cx);
+                                                    for arg in js_args.iter() {
+                                                        fn_handle.arg(arg.to_node_value(&mut cx)?);
                                                     }
+                                                    let result = fn_handle.apply::<JsValue, _>(&mut cx)?;
+                                                    
+                                                    // Handle Async Functions (Promises)
+                                                    if result.is_a::<JsPromise, _>(&mut cx) {
+                                                        let promise = result.downcast::<JsPromise, _>(&mut cx).unwrap();
+                                                        
+                                                        // FIX for Neon E0282 (Type Annotation)
+                                                        let then = promise
+                                                            .get::<JsValue, _, _>(&mut cx, "then")?
+                                                            .downcast::<JsFunction, _>(&mut cx)
+                                                            .or_else(|_| cx.throw_error("Global function returned a Promise, but 'then' is not a function"))?;
+
+                                                        let qs_success = quick_sender.clone();
+                                                        let success_func = JsFunction::new(&mut cx, move |mut cx| {
+                                                            let val = cx.argument::<JsValue>(0)?;
+                                                            let data = JsDataTypes::from_node_value(val, &mut cx).unwrap_or(JsDataTypes::Unknown);
+                                                            qs_success.blocking_send(QuickChannelMsg::ResolveGlobalPromise {
+                                                                id: req_id, 
+                                                                result: data, 
+                                                                error: None 
+                                                            }).ok();
+                                                            Ok(cx.undefined())
+                                                        })?;
+
+                                                        let qs_error = quick_sender.clone();
+                                                        let error_func = JsFunction::new(&mut cx, move |mut cx| {
+                                                            let val = cx.argument::<JsValue>(0)?;
+                                                            let err_msg = val.to_string(&mut cx)?.value(&mut cx);
+                                                            qs_error.blocking_send(QuickChannelMsg::ResolveGlobalPromise {
+                                                                id: req_id, 
+                                                                result: JsDataTypes::Undefined, 
+                                                                error: Some(err_msg)
+                                                            }).ok();
+                                                            Ok(cx.undefined())
+                                                        })?;
+
+                                                        // FIX for Neon E0277 (Upcast arguments)
+                                                        let args: Vec<Handle<JsValue>> = vec![success_func.upcast(), error_func.upcast()];
+                                                        then.call(&mut cx, promise, args)?;
+                                                    } else {
+                                                        // Handle Synchronous Return
+                                                        let data = JsDataTypes::from_node_value(result, &mut cx)?;
+                                                        quick_sender.blocking_send(QuickChannelMsg::ResolveGlobalPromise {
+                                                            id: req_id, 
+                                                            result: data, 
+                                                            error: None 
+                                                        }).ok();
+                                                    }
+                                                },
+                                                GlobalTypes::Data { value } => {
+                                                     quick_sender.blocking_send(QuickChannelMsg::ResolveGlobalPromise {
+                                                        id: req_id, 
+                                                        result: value.clone(), 
+                                                        error: None 
+                                                    }).ok();
                                                 }
-                                            
-
-                                            //  Ok(JsDataTypes::Unknown)
-                                            })
-                                            .join();
-
-
-                                        return match result_type {
-                                            Ok(result) => Ok(result.to_quick_value(realm).unwrap()),
-                                            Err(e) => Err(JsError::new(String::from("Join Error"), e.to_string(), String::from("")))
-                                        }
+                                            }
+                                            Ok(())
+                                        });
                                     }
 
-
-                                    Ok(realm.create_undefined().unwrap())
+                                    Ok(promise)
                                 }, 2).unwrap();
 
                                 let global_fns = &globals[channel_id];

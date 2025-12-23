@@ -112,6 +112,11 @@ pub enum QuickChannelMsg {
     EvalScript {
         target: ScriptEvalType
     },
+    ResolveGlobalPromise {
+        id: u32,
+        result: JsDataTypes,
+        error: Option<String>,
+    },
 }
 
 pub enum ScriptEvalType {
