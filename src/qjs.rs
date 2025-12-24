@@ -15,7 +15,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 use crate::{
-    GlobalTypes, JsDataTypes, NodeCallbackTypes, QuickChannelMsg, QuickJSOptions, ScriptEvalType,
+    EvalOutcome, GlobalTypes, JsDataTypes, NodeCallbackTypes, QuickChannelMsg, QuickJSOptions, ScriptEvalType,
     SyncChannelMsg, INT_COUNTERS, NODE_CALLBACKS, NODE_CHANNELS, QUICKJS_CALLBACKS, SYNC_SENDERS,
 };
 
@@ -251,6 +251,59 @@ pub fn build_runtime(
     return Arc::new(tokio::sync::Mutex::new(rtbuilder.build()));
 }
 
+async fn facade_to_jsdatatypes(
+    rt_clone: Arc<tokio::sync::Mutex<QuickJsRuntimeFacade>>,
+    realm_id: String,
+    facade: JsValueFacade,
+) -> JsDataTypes {
+    let rt_id = realm_id.clone();
+
+    let res: Result<JsDataTypes, JsDataTypes> = rt_clone
+        .lock()
+        .await
+        .loop_async(move |rt| {
+            let realm = rt.get_realm(&rt_id).unwrap();
+
+            let quick_val = realm.from_js_value_facade(facade).unwrap();
+
+            // ---- Error extraction (native) ----
+            if quick_val.is_error() {
+                // best-effort: message + stack (if available)
+                let message = quick_val.to_string().unwrap_or_else(|_| "Error".into());
+
+                let stack = if quick_val.is_object() {
+                    realm.get_object_property(&quick_val, "stack")
+                        .ok()
+                        .and_then(|s| if s.is_string() { s.to_string().ok() } else { None })
+                } else {
+                    None
+                };
+
+                let name = if quick_val.is_object() {
+                    realm.get_object_property(&quick_val, "name")
+                        .ok()
+                        .and_then(|n| if n.is_string() { n.to_string().ok() } else { None })
+                        .unwrap_or_else(|| "Error".into())
+                } else {
+                    "Error".into()
+                };
+
+                return Err(JsDataTypes::Error { name, message, stack });
+            }
+
+
+            // Normal value conversion
+            let v = JsDataTypes::from_quick_value(&quick_val, realm).unwrap();
+            Ok(v)
+        })
+        .await;
+
+    match res {
+        Ok(v) => v,
+        Err(e) => e, // Error already packaged as JsDataTypes::Error
+    }
+}
+
 pub struct QuickJSWorker {}
 
 impl QuickJSWorker {
@@ -266,6 +319,7 @@ impl QuickJSWorker {
         Ok(a)
     }
 
+
     pub async fn process_script_eval(
         realm_id: String,
         start_time: Instant,
@@ -273,93 +327,76 @@ impl QuickJSWorker {
         script_result: std::result::Result<JsValueFacade, quickjs_runtime::jsutils::JsError>,
         rt_clone: Arc<tokio::sync::Mutex<QuickJsRuntimeFacade>>,
         is_module: bool,
-    ) -> Result<JsDataTypes, String> {
+    ) -> Result<JsDataTypes, JsDataTypes> {
         let mut max_time_ms = max_eval_time.unwrap_or(0);
+
         match script_result {
-            Err(err) => return Err(err.to_string()),
-            Ok(mut script_result) => {
-                let mut promise_err = (None, None, false);
-                if script_result.is_js_promise() {
-                    while script_result.is_js_promise() {
-                        match script_result {
-                            JsValueFacade::JsPromise { ref cached_promise } => {
-                                let promise_future = cached_promise.get_promise_result();
-                                if let Some(_) = max_eval_time {
-                                    max_time_ms = max_time_ms
-                                        .saturating_sub(start_time.elapsed().as_millis() as u64);
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_millis(max_time_ms),
-                                        promise_future,
+            Err(err) => return Err(JsDataTypes::Error { name: "Error".into(), message: err.to_string(), stack: None }),
+            Ok(mut val) => {
+                // --- PROMISE RESOLUTION LOGIC ---
+                if val.is_js_promise() {
+                    match val {
+                        JsValueFacade::JsPromise { cached_promise } => {
+                            let promise_future = cached_promise.get_promise_result();
+
+                            let res = if let Some(_) = max_eval_time {
+                                max_time_ms = max_time_ms
+                                    .saturating_sub(start_time.elapsed().as_millis() as u64);
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_millis(max_time_ms),
+                                    promise_future,
+                                )
+                                .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => return Err(JsDataTypes::Error { name: "TimeoutError".into(), message: e.to_string(), stack: None }),
+                                }
+                            } else {
+                                promise_future.await
+                            };
+
+                            match res {
+                                // Promise Resolved Successfully
+                                Ok(Ok(resolved_val)) => {
+                                    val = resolved_val;
+                                }
+                                // Promise Rejected
+                                Ok(Err(rejected_val)) => {
+                                    // We don't have `realm` here. Convert using loop_async with the realm.
+                                    let rejected = facade_to_jsdatatypes(
+                                        rt_clone.clone(),
+                                        realm_id.clone(),
+                                        rejected_val,
                                     )
-                                    .await
-                                    {
-                                        Ok(done) => match done {
-                                            Ok(result) => match result {
-                                                Ok(js_value) => {
-                                                    script_result = js_value;
-                                                }
-                                                Err(e) => {
-                                                    promise_err.1 = Some(e);
-                                                    promise_err.2 = true;
-                                                    break;
-                                                }
-                                            },
-                                            Err(e) => {
-                                                promise_err.0 = Some(e);
-                                                promise_err.2 = true;
-                                                break;
-                                            }
-                                        },
-                                        Err(timeout_reached) => {
-                                            return Err(timeout_reached.to_string());
-                                        }
-                                    }
-                                } else {
-                                    match promise_future.await {
-                                        Ok(result) => match result {
-                                            Ok(js_value) => {
-                                                script_result = js_value;
-                                            }
-                                            Err(e) => {
-                                                promise_err.1 = Some(e);
-                                                promise_err.2 = true;
-                                                break;
-                                            }
-                                        },
-                                        Err(e) => {
-                                            promise_err.0 = Some(e);
-                                            promise_err.2 = true;
-                                            break;
-                                        }
-                                    }
+                                    .await;
+
+                                    return Err(rejected);
+                                }
+                                // Internal Runtime Error
+                                Err(e) => {
+                                    return Err(JsDataTypes::Error { name: "Error".into(), message: e.to_string(), stack: None });
                                 }
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
 
-                // CRITICAL FIX: Explicitly return error if promise rejected
-                if promise_err.2 {
-                    if let Some(e) = promise_err.1 {
-                        return Err(e.stringify());
-                    } else if let Some(e) = promise_err.0 {
-                        return Err(e.to_string());
-                    }
-                    return Err(String::from("Unknown promise error"));
-                }
-
+                // --- RESULT CONVERSION LOGIC ---
                 let rt_id = realm_id.clone();
-                let js_data_type = rt_clone
+                let eval_res: Result<JsDataTypes, JsDataTypes> = rt_clone
                     .lock()
                     .await
                     .loop_async(move |rt| {
                         let realm = rt.get_realm(&rt_id).unwrap();
+                        
+                        // 1. Check for Module Special Return
                         if is_module {
                             if let Ok(ret_val) = realm.get_global().and_then(|g| {
                                 realm.get_object_property(&g, "__qjs_module_return_value")
                             }) {
                                 if !ret_val.is_undefined() {
+                                    // Clear the value
                                     let _ = realm.get_global().and_then(|g| {
                                         realm.set_object_property(
                                             &g,
@@ -367,18 +404,59 @@ impl QuickJSWorker {
                                             &realm.create_undefined().unwrap(),
                                         )
                                     });
-                                    return JsDataTypes::from_quick_value(&ret_val, realm).unwrap();
+                                    let v = JsDataTypes::from_quick_value(&ret_val, realm).unwrap();
+                                    return Ok(v);
                                 }
                             }
                         }
-                        return JsDataTypes::from_quick_value(
-                            &realm.from_js_value_facade(script_result).unwrap(),
-                            realm,
-                        )
-                        .unwrap();
+
+                        let quick_val = realm.from_js_value_facade(val).unwrap();
+
+
+                        if quick_val.is_promise() {
+                            return Err(JsDataTypes::Error { name: "Error".into(), message: "Script returned a Promise that could not be awaited. (Likely a top-level Promise.reject)".to_string(), stack: None });
+                        }
+
+                        // 2. Check for Error Objects (Native Check)
+                        if quick_val.is_error() {
+                            let message = realm
+                                .get_object_property(&quick_val, "message")
+                                .ok()
+                                .and_then(|m| if m.is_string() { m.to_string().ok() } else { None })
+                                .unwrap_or_else(|| "Error".to_string());
+
+                            let name = realm
+                                .get_object_property(&quick_val, "name")
+                                .ok()
+                                .and_then(|n| if n.is_string() { n.to_string().ok() } else { None })
+                                .unwrap_or_else(|| "Error".to_string());
+
+                            let stack = realm
+                                .get_object_property(&quick_val, "stack")
+                                .ok()
+                                .and_then(|s| if s.is_string() { s.to_string().ok() } else { None });
+
+                            return Err(JsDataTypes::Error { name, message, stack });
+                        }
+
+                        // 3. Check for Error Objects (Duck Typing)
+                        if quick_val.is_object() {
+                            let has_msg = realm.get_object_property(&quick_val, "message");
+                            let has_stack = realm.get_object_property(&quick_val, "stack");
+                            if let (Ok(m), Ok(s)) = (has_msg, has_stack) {
+                                if !m.is_undefined() && !s.is_undefined() {
+                                    let msg_str = m.to_string().unwrap_or("Error".into());
+                                    return Err(JsDataTypes::Error { name: "Error".into(), message: msg_str, stack: None });
+                                }
+                            }
+                        }
+
+                        let v = JsDataTypes::from_quick_value(&quick_val, realm).unwrap();
+                        Ok(v)
                     })
                     .await;
-                return Ok(js_data_type);
+
+                return eval_res;
             }
         }
     }
@@ -513,19 +591,73 @@ pub fn quickjs_thread(
                         }
                     }
                     SyncChannelMsg::SendError { e, def } => {
-                        let unlocked = NODE_CHANNELS.blocking_lock();
-                        let channel = &unlocked[channel_id];
-                        if let Some(channel) = channel {
-                            channel
-                                .send(move |mut cx| {
-                                    let msg = cx.string(e);
-                                    def.reject(&mut cx, msg);
-                                    Ok(())
-                                })
-                                .join()
-                                .unwrap();
+                            
+                            let unlocked = NODE_CHANNELS.blocking_lock();
+                            let channel = &unlocked[channel_id];
+                            if let Some(channel) = channel {
+                                channel
+                                    .send(move |mut cx| {
+                                        // If this is our structured Error payload, materialize a real JS Error.
+                                        let js_val: Handle<JsValue> = match &e {
+                                            JsDataTypes::Error { name, message, stack } => {
+                                                let js_err = cx.error(message.as_str())?;
+                                                let obj = js_err.upcast::<JsObject>();
+
+                                                let name_val = cx.string(name.as_str());
+                                                obj.set(&mut cx, "name", name_val)?;
+                                                if let Some(stack) = stack {
+                                                    let stack_val = cx.string(stack.as_str());
+                                                    obj.set(&mut cx, "stack", stack_val)?;
+                                                }
+
+                                                obj.as_value(&mut cx)
+                                            }
+
+                                            JsDataTypes::Json { msg } => {
+                                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) {
+                                                    let is_err = v
+                                                        .get("__quickjs_vm_type")
+                                                        .and_then(|t| t.as_str())
+                                                        .map(|t| t == "Error")
+                                                        .unwrap_or(false);
+
+                                                    if is_err {
+                                                        let name = v
+                                                            .get("name")
+                                                            .and_then(|n| n.as_str())
+                                                            .unwrap_or("Error");
+                                                        let message = v
+                                                            .get("message")
+                                                            .and_then(|m| m.as_str())
+                                                            .unwrap_or("Error");
+                                                        let stack = v.get("stack").and_then(|s| s.as_str());
+
+                                                        let err = cx.error(message)?;
+                                                        let obj = err.upcast::<JsObject>();
+                                                        let obj_val = cx.string(name);
+                                                        obj.set(&mut cx, "name", obj_val)?;
+                                                        if let Some(stack) = stack {
+                                                            let stack_val = cx.string(stack);
+                                                            obj.set(&mut cx, "stack", stack_val)?;
+                                                        }
+                                                        obj.as_value(&mut cx)
+                                                    } else {
+                                                        e.to_node_value(&mut cx)?
+                                                    }
+                                                } else {
+                                                    e.to_node_value(&mut cx)?
+                                                }
+                                            }
+                                            _ => e.to_node_value(&mut cx)?,
+                                        };
+
+                                        def.reject(&mut cx, js_val);
+                                        Ok(())
+                                    })
+                                    .join()
+                                    .unwrap();
+                            }
                         }
-                    }
                     SyncChannelMsg::SendMessageToNode { message } => {
                         let cbs = msg_cb_clone.clone();
                         let unlocked = NODE_CHANNELS.blocking_lock();
@@ -609,14 +741,10 @@ pub fn quickjs_thread(
                     }
                     SyncChannelMsg::Quit { def } => {
                         let cbs = msg_cb_clone.clone();
-                        // 1. Acquire lock to get the channel
                         let unlocked = NODE_CHANNELS.blocking_lock();
 
                         if let Some(channel) = &unlocked[channel_id] {
-                            // 2. Send the cleanup task to the Node Main Thread
                             channel.send(move |mut cx| {
-                                // A. Run user-defined 'close' listeners (e.g. qjs.on('close'))
-                                // Use a scope to ensure lock is dropped before we clean up
                                 {
                                     let unlocked_cbs = cbs.try_lock().unwrap();
                                     for cbb in unlocked_cbs.iter() {
@@ -630,34 +758,28 @@ pub fn quickjs_thread(
                                     }
                                 }
 
-                                // B. CLEANUP: Drop all strong references (Roots) held by this worker
-                                // This is crucial to allow the GC to collect the associated JS objects
                                 {
                                     let mut cb_store = crate::NODE_CALLBACKS.blocking_lock();
-                                    cb_store[channel_id] = crate::NodeCallbacks::default(); // Replaces with None/Empty
+                                    cb_store[channel_id] = crate::NodeCallbacks::default();
 
                                     let mut global_store = crate::GLOBAL_PTRS.blocking_lock();
                                     global_store[channel_id].clear();
+
+                                    let mut promises = PENDING_GLOBAL_PROMISES.blocking_lock();
+                                    promises.clear();
                                 }
 
-                                // C. CRITICAL: Drop the Channel handle on the Main Thread.
-                                // We do this explicitly to ensure the N-API ThreadSafeFunction is released now.
                                 {
                                     let mut channels = crate::NODE_CHANNELS.blocking_lock();
                                     channels[channel_id] = None;
                                 }
 
-                                // D. Resolve the Promise to let JS know we are done
                                 let handle = cx.undefined();
                                 def.resolve(&mut cx, handle);
                                 Ok(())
                             });
                         }
-
-                        // 3. Drop the lock in the background thread immediately
                         drop(unlocked);
-
-                        // Break the loop to stop the background thread
                         break;
                     }
                 }
@@ -707,9 +829,23 @@ pub fn quickjs_thread(
                                     return realm.create_error("Internal", "Node runtime closed", "");
                                 }
                                 match resp_rx.blocking_recv() {
-                                    Ok(Ok(result_data)) => { return result_data.to_quick_value(realm); },
-                                    Ok(Err(e_str)) => { return realm.create_error("ExecutionError", e_str.as_str(), ""); },
-                                    Err(_) => { return realm.create_error("Internal", "Response channel closed", ""); }
+                                    Ok(EvalOutcome::Fulfilled(result_data)) => {
+                                        return result_data.to_quick_value(realm);
+                                    }
+                                    Ok(EvalOutcome::Rejected(err_val)) => {
+                                        // Preserve Error details if present; otherwise throw a generic ExecutionError.
+                                        match err_val {
+                                            JsDataTypes::Error { name, message, stack } => {
+                                                return realm.create_error(name.as_str(), message.as_str(), stack.as_deref().unwrap_or(""));
+                                            }
+                                            other => {
+                                                return realm.create_error("ExecutionError", other.to_string().as_str(), "");
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        return realm.create_error("Internal", "Response channel closed", "");
+                                    }
                                 }
                             } else {
                                 let deferred_script = Script::new("create_deferred", "(() => { let m; const p = new Promise((res, rej) => { m = { res, rej }; }); return { p, res: m.res, rej: m.rej }; })()");
@@ -836,9 +972,6 @@ pub fn quickjs_thread(
                                 realm.eval(Script::new(std::format!("init_globals.js").as_str(), init_script.as_str())).unwrap();
                             }).await;
                         }
-
-                        // ... REMAINING CASES SAME AS PROVIDED PREVIOUSLY ...
-                        // Ensure EvalScript block resets INT_COUNTERS.2 correctly as provided in previous answer
                         QuickChannelMsg::EvalScript { target } => {
                             {
                                 let mut int_counters = INT_COUNTERS.lock().await;
@@ -849,7 +982,6 @@ pub fn quickjs_thread(
                                     int_counters[channel_id].2 = 0;
                                 }
                             }
-                            // ... rest of EvalScript ...
                             if let ScriptEvalType::Sync { sender, .. } = &target {
                                 let mut map: tokio::sync::MutexGuard<HashMap<usize, tokio::sync::mpsc::Sender<crate::SyncEvalRequest>>> = ACTIVE_SYNC_REQUESTS.lock().await;
                                 map.insert(channel_id, sender.clone());
@@ -867,6 +999,7 @@ pub fn quickjs_thread(
                                     let eval_result = if is_module_eval {
                                         realm.eval_module(use_script)
                                     } else {
+                                        // FIX: Removed 'None' argument here (Realm Adapter eval)
                                         realm.eval(use_script)
                                     };
                                     match eval_result {
@@ -880,6 +1013,7 @@ pub fn quickjs_thread(
                                         Err(e) => return Err(e),
                                     }
                                 } else {
+                                    // FIX: Removed 'None' argument here (Realm Adapter eval)
                                     match realm.eval(Script::new(".", "undefined")) {
                                         Ok(eval_result) => { return realm.to_js_value_facade(&eval_result); }
                                         Err(e) => return Err(e),
@@ -898,8 +1032,8 @@ pub fn quickjs_thread(
                                             map.remove(&channel_id);
                                         }
                                         match target {
-                                            ScriptEvalType::Sync { sender, .. } => { sender.send(crate::SyncEvalRequest::Done { result: Err(e.to_string()) }).await.unwrap_or(()); },
-                                            ScriptEvalType::Async { promise, .. }  => { let sync_channel = SYNC_SENDERS.lock().await; sync_channel[channel_id].send(SyncChannelMsg::SendError { e: e.to_string(), def: promise }).await.unwrap(); }
+                                            ScriptEvalType::Sync { sender, .. } => { sender.send(crate::SyncEvalRequest::Done { result: (EvalOutcome::Rejected(JsDataTypes::Error { name: "Error".into(), message: e.to_string(), stack: None }), start_cpu, start_time) }).await.unwrap_or(()); },
+                                            ScriptEvalType::Async { promise, .. }  => { let sync_channel = SYNC_SENDERS.lock().await; sync_channel[channel_id].send(SyncChannelMsg::SendError { e: JsDataTypes::Error { name: "Error".into(), message: e.to_string(), stack: None }, def: promise }).await.unwrap(); }
                                         }
                                         return;
                                     }
@@ -916,8 +1050,10 @@ pub fn quickjs_thread(
                             match target {
                                 ScriptEvalType::Sync { sender, .. } => {
                                     match out {
-                                        Ok(data) => { sender.send(crate::SyncEvalRequest::Done { result: Ok((data, start_cpu, start_time)) }).await.unwrap(); },
-                                        Err(e) => { sender.send(crate::SyncEvalRequest::Done { result: Err(e) }).await.unwrap(); }
+                                        Ok(data) => { sender.send(crate::SyncEvalRequest::Done { result: (EvalOutcome::Fulfilled(data), start_cpu, start_time) })
+                                            .await.unwrap(); },
+                                        Err(e) => { sender.send(crate::SyncEvalRequest::Done { result: (EvalOutcome::Rejected(e), start_cpu, start_time) })
+                                            .await.unwrap(); }
                                     }
                                 },
                                 ScriptEvalType::Async { promise, .. }  => {

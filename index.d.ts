@@ -6,6 +6,37 @@ export type EvalStats = {
     cpuTimeMs: number;
 }
 
+export type QuickJSMemoryStats = {
+    realm_ct: number,
+    malloc_size: number,
+    malloc_limit: number,
+    /** Number of bytes being used by VM Memory */
+    memory_used_size: number,
+    malloc_count: number,
+    memory_used_count: number,
+    atom_count: number,
+    atom_size: number,
+    str_count: number,
+    str_size: number,
+    obj_count: number,
+    obj_size: number,
+    prop_count: number,
+    prop_size: number,
+    shape_count: number,
+    shape_size: number,
+    js_func_count: number,
+    js_func_size: number,
+    js_func_code_size: number,
+    js_func_pc2line_count: number,
+    js_func_pc2line_size: number,
+    c_func_count: number,
+    array_count: number,
+    fast_array_count: number,
+    fast_array_elements: number,
+    binary_object_count: number,
+    binary_object_size: number
+};
+
 export type QuickJSOptions = {
     console?: Console;
     channelSize?: number;
@@ -69,7 +100,7 @@ export class QuickJS extends EventEmitter {
     gc(): Promise<number>;
 
     /** Get memory statistics */
-    memory(): Promise<Record<string, number>>;
+    memory(): Promise<QuickJSMemoryStats>;
 
     /** Close the runtime */
     close(): Promise<void>;

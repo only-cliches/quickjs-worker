@@ -1,71 +1,91 @@
 # quickjs-vm
 
-**A high-performance, native Node.js binding for the [QuickJS](https://bellard.org/quickjs/) Javascript Engine.**
+**High-performance native Node.js bindings for the [QuickJS](https://bellard.org/quickjs/) JavaScript engine.**
 
-`quickjs-vm` allows you to safely execute untrusted JavaScript code inside a sandboxed environment within your Node.js application. Unlike other libraries that compile QuickJS to WebAssembly (WASM), `quickjs-vm` uses native N-API bindings (written in Rust).
+`quickjs-vm` allows you to safely execute **untrusted JavaScript** inside a sandboxed QuickJS runtime embedded directly in Node.js.
 
-This results in **significantly higher performance**, lower overhead, and true synchronous execution capabilities compared to WASM-based alternatives like `quickjs-emscripten`.
+Unlike libraries that compile QuickJS to WebAssembly, `quickjs-vm` uses **native N-API bindings written in Rust**, providing:
+
+- ⚡ Significantly higher performance
+- 🧠 Lower memory overhead
+- ⏱ True synchronous execution (no async WASM trampolines)
+
+If you need **fast, deterministic, sandboxed JavaScript execution** inside Node — this library is built for that purpose.
+
+---
 
 ## 🚀 Features
 
-**⚡️ High Performance**: Runs directly on the host CPU without WASM interpretation overhead.  
-**🔄 Async & Sync Evaluation**: Strict `evalSync` for blocking operations and `eval` (Promise-based) for async workflows.  
-**📦 ES Modules Support**: Full support for `import` / `export` syntax with custom module resolution handlers.  
-**🛡 Sandboxing & Limits**:  
-* **Timeouts**: `maxEvalMs` to kill infinite loops.
-* **Memory Limits**: `maxMemoryBytes` to prevent OOM crashes.
-* **Stack Limits**: Control recursion depth.
+### ⚡ Performance
+- Native QuickJS runtime (no WASM)
+- Direct execution on the host CPU
+- Lower startup and execution overhead
 
+### 🔄 Execution Modes
+- `evalSync()` — blocking, deterministic execution
+- `eval()` — Promise-based async execution
+- `evalModule()` — ES module support
 
-**💾 Data Serialization**: Seamless round-trip data passing for:
-* Primitives (`string`, `number`, `boolean`, `null`, `undefined`)
-* Complex Types (`Date`, `Buffer` / `Uint8Array`, JSON Objects)
-* Functions (pass Node.js functions into QuickJS)
+### 🛡 Sandboxing & Limits
+Protect your host application from runaway or malicious scripts:
 
+- **Execution timeouts** (`maxEvalMs`)
+- **Memory limits** (`maxMemoryBytes`)
+- **Prevent Infinite Loops** (`maxInterrupt`)
+- **Stack depth limits** (prevents recursion abuse)
 
-**📞 Inter-Process Communication**:
-* `postMessage` API for bidirectional messaging between Node and the QuickJS worker.
-* Event-based architecture (`on('message')`, `on('close')`).
+### 💾 Data Serialization
+Safe, seamless data exchange between Node and QuickJS:
 
+- Primitives (`string`, `number`, `boolean`, `null`, `undefined`)
+- Structured data (Objects, Arrays, JSON)
+- `Date`
+- `Buffer` / `Uint8Array`
+- Functions (call Node functions from QuickJS)
 
-**⚙️ Bytecode**: Pre-compile JavaScript to bytecode (`getByteCode`) and execute it later (`loadByteCode`) for faster startup times.  
-**🧹 Lifecycle Management**:  
-* Explicit `close()` to release native resources.
-* `gc()` to force garbage collection.
-* `memory()` inspection.
-* `Symbol.asyncDispose` support for the `using` keyword.
+### 📞 Messaging & IPC
+- Bidirectional `postMessage` API
+- Event-based lifecycle:
+  - `on('message')`
+  - `on('close')`
 
-
+### ⚙️ Bytecode Support
+- Compile source → bytecode (`getByteCode`)
+- Execute bytecode later (`loadByteCode`)
+- Faster startup for repeated workloads
 
 ---
 
 ## 📊 Performance Benchmarks
 
-Because `quickjs-vm` binds directly to the native QuickJS library via Rust/N-API, it outperforms WASM-based implementations significantly.
+Because `quickjs-vm` binds directly to the native QuickJS C library, it **significantly outperforms** WASM-based implementations.
 
-We ran the standard **V8 Benchmark Suite (v7)** comparing `quickjs-vm` against `quickjs-emscripten`.
+Benchmarks were run using the **V8 Benchmark Suite (v7)** comparing:
+
+- `quickjs-vm` (native)
+- `quickjs-emscripten` (WASM)
 
 ### 🏆 Overall Score (Higher is Better)
 
 | Library | Score | Improvement |
-| --- | --- | --- |
+|------|------|------|
 | **quickjs-vm (Native)** | **1052** | **~42% Faster** 🚀 |
-| quickjs-emscripten (WASM) | 742 |  |
+| quickjs-emscripten (WASM) | 742 | |
 
-### 📉 Detailed Breakdown
+### 📉 Detailed Results
 
-| Benchmark | quickjs-vm | quickjs-emscripten | Difference |
-| --- | --- | --- | --- |
-| **Richards** | **1014** | 579 | +75.1% |
-| **DeltaBlue** | **1043** | 653 | +59.7% |
-| **Crypto** | **878** | 556 | +57.9% |
-| **RayTrace** | **1008** | 773 | +30.4% |
-| **EarleyBoyer** | **1948** | 1409 | +38.2% |
-| **RegExp** | **270** | 227 | +18.9% |
-| **Splay** | **2208** | 1862 | +18.5% |
-| **NavierStokes** | **1385** | 948 | +46.1% |
+| Benchmark | quickjs-vm | emscripten | Δ |
+|--------|-----------|------------|----|
+| Richards | **1014** | 579 | +75% |
+| DeltaBlue | **1043** | 653 | +60% |
+| Crypto | **878** | 556 | +58% |
+| RayTrace | **1008** | 773 | +30% |
+| EarleyBoyer | **1948** | 1409 | +38% |
+| RegExp | **270** | 227 | +19% |
+| Splay | **2208** | 1862 | +19% |
+| NavierStokes | **1385** | 948 | +46% |
 
-*Benchmarks run on macOS M1/M2 architecture. Results may vary by machine, but the relative performance gap is consistent.*
+> Benchmarks run on macOS (Apple Silicon). Absolute numbers vary by machine, but the relative performance gap is consistent.
 
 ---
 
@@ -73,246 +93,275 @@ We ran the standard **V8 Benchmark Suite (v7)** comparing `quickjs-vm` against `
 
 ```bash
 npm install quickjs-vm
-
-```
+````
 
 ---
 
 ## 💻 Usage
 
-### Basic Evaluation & Memory Inspection
+### Basic Evaluation
 
-You can execute code and immediately inspect the runtime's memory usage to ensure scripts aren't leaking or consuming too many resources.
-
-```javascript
+```js
 const { QuickJS } = require('quickjs-vm');
 
 const vm = new QuickJS();
 
-// Async Evaluation
 const result = await vm.eval('1 + 2');
-console.log('Result:', result); // 3
+console.log(result); // 3
 
-// Synchronous Evaluation
+// optionally resolves promises as well
+const result = await vm.eval('new Promise(res => res(1 + 2))');
+console.log(result); // 3
+
+// blocking call
 const syncResult = vm.evalSync('"Hello " + "World"');
-console.log('Sync Result:', syncResult); // "Hello World"
+console.log(syncResult); // Hello World
 
-// Check memory usage after execution
-const stats = await vm.memory();
-console.log('Memory Used:', stats); 
-// Output example: { memory_used_size: 2048, memory_limit: -1, ... }
+// get number of bytes currently in use by the vm
+const memory = await vm.memory();
+console.log(memory.memory_used_size);
 
 await vm.close();
-
-```
-
-### Function Calls with Arguments
-
-You can pass arguments directly into your QuickJS scripts using the `{ args: [...] }` option. This is safer and cleaner than string concatenation.
-
-```javascript
-const vm = new QuickJS();
-
-// Define a function in QuickJS that accepts arguments
-const script = `
-    (greeting, name, count) => {
-        const lines = [];
-        for (let i = 0; i < count; i++) {
-            lines.push(greeting + ", " + name + "!");
-        }
-        return lines;
-    }
-`;
-
-// Pass arguments securely from Node.js
-const result = await vm.eval(script, { 
-    args: ["Hello", "Developer", 3] 
-});
-
-console.log(result);
-// Output: [ "Hello, Developer!", "Hello, Developer!", "Hello, Developer!" ]
-
-```
-
-### Managing Global State
-
-You can inject global variables into the QuickJS environment in two ways: **at initialization** or **at runtime**.
-
-#### 1. Initialization (Static Globals)
-
-Use the `globals` option in the constructor to define variables that should be available immediately when the VM starts. This is ideal for configuration, polyfills, or standard library helper functions.
-
-```javascript
-const vm = new QuickJS({
-    // Define globals that exist before any script runs
-    globals: {
-        version: '1.0.0',
-        environment: process.env.NODE_ENV || 'development',
-        utils: {
-            log: (msg) => console.log(`[LOG]: ${msg}`),
-            add: (a, b) => a + b
-        }
-    }
-});
-
-// These globals are immediately available
-const result = await vm.eval(`
-    utils.log("System version: " + version);
-    utils.add(10, 20);
-`);
-console.log(result); // 30
-
-```
-
-#### 2. Runtime (Dynamic Globals)
-
-Use `setGlobal` to inject variables after the VM has started. This is useful for passing data that is fetched asynchronously or updated during execution.
-
-```javascript
-const vm = new QuickJS();
-
-// ... some time later ...
-
-// Fetch data from a database or API
-const userData = await db.getUser(123);
-
-// Inject it into the running VM
-await vm.setGlobal('user', userData);
-
-// Now the script can access the new data
-const userName = await vm.eval('user.name');
-console.log(userName);
-
-```
-
-### Advanced Configuration (Limits & Globals)
-
-Secure your sandbox by setting memory and time limits, and inject custom globals.
-
-```javascript
-const vm = new QuickJS({
-    maxMemoryBytes: 1024 * 1024 * 5, // 5MB Limit
-    maxEvalMs: 500,                  // 500ms Timeout
-    console: console,                // Forward console.log to Node
-});
-
-// Inject a function (can be async!)
-await vm.setGlobal('fetchData', async (id) => {
-    // This runs in Node.js, called from QuickJS
-    return db.users.find(id);
-});
-
-try {
-    const user = await vm.eval('fetchData(123)');
-    // this works too:
-    // const user = await vm.eval('fetchData', {args: [ 123 ]});
-} catch (err) {
-    console.error('Script failed:', err);
-}
-
-```
-
-### ES Modules & Custom Imports
-
-You can define a custom import handler to load modules from the file system, a database, or memory.
-
-```javascript
-const vm = new QuickJS({
-    // define function to return modules
-    imports: (path) => {
-        if (path === './math.js') {
-             // return source code
-            return 'export const add = (a, b) => a + b;';
-        }
-        throw new Error('Module not found');
-    }
-});
-
-const code = `
-    import { add } from './math.js';
-    export const result = add(10, 20);
-    moduleReturn(result); // Helper to return value from module
-`;
-
-const result = await vm.evalModule(code);
-console.log(result); // 30
-
-```
-
-### Communication Channel (postMessage)
-
-Use the bidirectional messaging channel for event-driven architectures.
-
-```javascript
-// Node.js Side
-vm.on('message', (msg) => {
-    console.log('Received from QJS:', msg);
-});
-
-// Send data to QuickJS
-vm.postMessage({ type: 'INIT', payload: '...' });
-
-// ------------------------------------------------
-
-// QuickJS Side (inside eval)
-on('message', (msg) => {
-    if (msg.type === 'INIT') {
-        postMessage({ status: 'READY' });
-    }
-});
-
 ```
 
 ---
 
-## 🛠 API Reference
+### Passing Arguments Safely
 
-### `new QuickJS(options)`
+Avoid string interpolation — pass arguments explicitly:
 
-* `options.maxMemoryBytes`: (Number) Max memory for the runtime.
-* `options.maxEvalMs`: (Number) Max execution time before throwing an interrupt error (for each eval).
-* `options.imports`: (Function) Callback `(path) => string` for loading module source code.
-* `options.console`: (Object) Pass the Node `console` object to pass through vm logging to node, otherwise provide your own callbacks.
-* `options.globals`: (Object) Initial map of globals to inject at startup.
+```js
+const vm = new QuickJS();
 
-### Methods
+const fn = `
+  (greeting, name, count) => {
+    return Array.from({ length: count }, () =>
+      \`\${greeting}, \${name}!\`
+    );
+  }
+`;
 
-* `eval(code, options)`: Execute code asynchronously. Returns a Promise.
-* `options.args`: (Array) List of arguments to pass to the script (if the script returns a function).
+const result = await vm.eval(fn, {
+  args: ['Hello', 'Developer', 3]
+});
 
+console.log(result);
+// ["Hello, Developer!", "Hello, Developer!", "Hello, Developer!"]
+```
 
-* `evalSync(code, options)`: Execute code synchronously. Returns the result.
-* `evalModule(code)`: Execute code as an ES Module.
-* `setGlobal(key, value)`: Inject a global variable or function at runtime.
-* `getByteCode(code)`: Compile JS source to a `Uint8Array` of bytecode.
-* `loadByteCode(bytes)`: Execute pre-compiled bytecode.
-* `postMessage(msg)`: Send a message to the VM.
-* `memory()`: Returns memory usage statistics (malloc limit, memory used, address count, etc).
-* `gc()`: Force garbage collection.
-* `close()`: Shut down the VM and release native resources.
+---
+
+### Global State
+
+#### Static Globals (at startup)
+
+```js
+const vm = new QuickJS({
+  globals: {
+    version: '1.0.0',
+    utils: {
+      add: (a, b) => a + b,
+      log: msg => console.log('[VM]', msg)
+      getData: async (opts) => {
+        // runs in Node context, callable from QuickJS
+        return new Promise((res, rej) => {
+          setTimeout(() => {
+            res("Hello, Data")
+          }, 100);
+        })
+      }
+    }
+  }
+});
+
+await vm.eval('utils.log(version); utils.add(10, 20)');
+```
+
+#### Dynamic Globals (runtime)
+
+```js
+await vm.setGlobal('user', {name: "John"}};
+const name = await vm.eval('user.name');
+```
+
+---
+
+### Advanced Configuration
+
+```js
+const vm = new QuickJS({
+  maxMemoryBytes: 5 * 1024 * 1024,
+  maxEvalMs: 500,
+  // pass through vm console.XXX to NodeJS
+  console: console
+  // optional: provide your own handlers:
+  // console: { log: ..., error: ... }
+});
+
+await vm.setGlobal('fetchUser', async id => {
+  return db.users.find(id);
+});
+
+const user = await vm.eval('fetchUser(123)');
+```
+
+---
+
+### ES Modules & Custom Imports
+
+```js
+const vm = new QuickJS({
+  imports: path => {
+    if (path === './math.js') {
+      return 'export const add = (a, b) => a + b;';
+    }
+    throw new Error('Module not found');
+  }
+});
+
+const result = await vm.evalModule(`
+  import { add } from './math.js';
+  export default add(10, 20);
+`);
+```
+
+---
+
+### Messaging (`postMessage`)
+
+```js
+vm.on('message', msg => {
+  console.log('From VM:', msg);
+});
+
+vm.postMessage({ type: 'INIT' });
+```
+
+```js
+// Inside QuickJS
+on('message', msg => {
+  if (msg.type === 'INIT') {
+    postMessage({ status: 'READY' });
+  }
+});
+```
+
+---
+
+## 🧠 When Should I Use This?
+
+### `quickjs-vm` vs Node `vm`
+
+| Node `vm`         | quickjs-vm                  |
+| ----------------- | --------------------------- |
+| Shares V8 runtime | Separate JS engine          |
+| Limited isolation | Stronger isolation boundary |
+| No memory limits  | Enforced memory caps        |
+| Same event loop   | Independent execution       |
+
+**Use `quickjs-vm`** when running untrusted or user-supplied code.
+
+---
+
+### `quickjs-vm` vs `isolated-vm`
+
+| isolated-vm       | quickjs-vm             |
+| ----------------- | ---------------------- |
+| V8 isolates       | QuickJS runtime        |
+| Higher overhead   | Lower memory footprint |
+| Async-only APIs   | True sync execution    |
+| Larger dependency | Smaller native core    |
+
+**Use `quickjs-vm`** when you want deterministic sync execution, lower memory use, or simpler deployment.
+
+---
+
+### `quickjs-vm` vs WASM (emscripten)
+
+| quickjs-emscripten    | quickjs-vm        |
+| --------------------- | ----------------- |
+| Interpreted execution | Native execution  |
+| Async trampolines     | True sync         |
+| Higher memory         | Lower overhead    |
+| Slower startup        | Faster cold start |
+
+**Use `quickjs-vm`** when performance, latency, and predictability matter.
+
+---
+
+## 🏗 Architecture & Lifecycle
+
+### High-Level Architecture
+
+```
+┌─────────────┐
+│   Node.js   │
+│ Application │
+└─────┬───────┘
+      │ N-API (Rust)
+┌─────▼───────────────────────────┐
+│         quickjs-vm              │
+│  ┌───────────────────────────┐  │
+│  │  Control Thread (Node)    │◄─┼── eval / postMessage
+│  └───────────┬───────────────┘  │
+│              │ Channels         │
+│  ┌───────────▼───────────────┐  │
+│  │  QuickJS Runtime Thread   │  │
+│  │  • QuickJS VM             │  │
+│  │  • Memory limits          │  │
+│  │  • Execution timeouts     │  │
+│  └───────────┬───────────────┘  │
+│              │ Messages         │
+│  ┌───────────▼───────────────┐  │
+│  │  Dispatcher / Callbacks   │──┼── JS callbacks
+│  └───────────────────────────┘  │
+└─────────────────────────────────┘
+```
+
+### Execution Lifecycle
+
+1. **VM creation**
+
+   * Native QuickJS runtime initialized
+   * Memory and execution limits applied
+   * Static globals injected
+
+2. **Script execution**
+
+   * Code is sent to the runtime thread
+   * Execution is interrupted if limits are exceeded
+   * Results are serialized back to Node
+
+3. **Messaging**
+
+   * `postMessage` enables async communication
+   * Messages are queued and dispatched safely
+
+4. **Shutdown**
+
+   * `close()` signals all worker threads
+   * Native resources are freed deterministically
+   * No lingering handles
 
 ---
 
 ## 🧪 Testing
 
-This project maintains a high standard of quality with a comprehensive **Jest** test suite covering:
+The project includes a comprehensive **Jest** test suite covering:
 
-* Round-trip serialization of complex data types (Date, Buffer, etc).
-* Sync vs Async execution correctness.
-* Promise resolution for host functions.
-* Module system resolution.
-* Resource cleanup and memory leaks (using `weak` references checks).
-* Benchmark scripts (V8 suite).
-
-Run tests locally:
+* Serialization correctness
+* Sync vs async behavior
+* Promise handling
+* Module resolution
+* Resource cleanup & leak detection
+* Performance benchmarks
 
 ```bash
 npm test
-
 ```
 
 ---
 
-## License
+## 📄 License
 
 MIT

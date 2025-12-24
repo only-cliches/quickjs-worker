@@ -11,7 +11,7 @@ async function main() {
         console: console,
     });
     await runtime.eval(benchScript);
-    // await runtime.close();
+    await runtime.close();
 
     console.log("\n\n=== quickjs-emscripten ===\n");
     const qjs = await getQuickJS();

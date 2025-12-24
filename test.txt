@@ -1,0 +1,115 @@
+
+> quickjs-vm@0.2.0 test
+> cargo test && jest
+
+   Compiling quickjs-vm v0.2.0 (/Users/scottlott/Developer/quickjs-worker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.62s
+     Running unittests src/lib.rs (target/debug/deps/quickjs_vm-8e556fff7341c8fa)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+PASS test/data_serialization.spec.ts
+FAIL test/promise_resolution.spec.ts
+  ● Promise Resolution Across Boundaries › Error Propagation Across Boundary › QuickJS -> Node (rejections) › should reject with a real Error instance (preserve message)
+
+    expect(received).toBeInstanceOf(expected)
+
+    Expected constructor: Error
+    Received constructor: Error
+
+      107 |                     throw new Error("Expected rejection");
+      108 |                 } catch (e: any) {
+    > 109 |                     expect(e).toBeInstanceOf(Error);
+          |                               ^
+      110 |                     expect(e.message).toContain("Direct Rejection");
+      111 |                 }
+      112 |             });
+
+      at Object.<anonymous> (test/promise_resolution.spec.ts:109:31)
+
+  ● Promise Resolution Across Boundaries › Error Propagation Across Boundary › QuickJS -> Node (rejections) › should preserve Error.name when QuickJS sets a custom name
+
+    expect(received).toBeInstanceOf(expected)
+
+    Expected constructor: Error
+    Received constructor: Error
+
+      122 |                     throw new Error("Expected rejection");
+      123 |                 } catch (e: any) {
+    > 124 |                     expect(e).toBeInstanceOf(Error);
+          |                               ^
+      125 |                     expect(e.name).toBe("MyQuickJSError");
+      126 |                     expect(e.message).toContain("Boom");
+      127 |                 }
+
+      at Object.<anonymous> (test/promise_resolution.spec.ts:124:31)
+
+  ● Promise Resolution Across Boundaries › Error Propagation Across Boundary › QuickJS -> Node (rejections) › should include stack when available (non-brittle)
+
+    expect(received).toBeInstanceOf(expected)
+
+    Expected constructor: Error
+    Received constructor: Error
+
+      134 |                 } catch (e: any) {
+      135 |                     // stack can vary by engine/version; keep this loose
+    > 136 |                     expect(e).toBeInstanceOf(Error);
+          |                               ^
+      137 |                     if (typeof e.stack === "string") {
+      138 |                         expect(e.stack).toContain("Stack Me");
+      139 |                     }
+
+      at Object.<anonymous> (test/promise_resolution.spec.ts:136:31)
+
+  ● Promise Resolution Across Boundaries › Error Propagation Across Boundary › Node -> QuickJS (thrown/rejected from injected functions) › should surface Node Error.message + name inside QuickJS catch
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 3
+    + Received  + 1
+
+      Object {
+    -   "code": "E_NODE",
+    -   "message": "Node Boom!",
+    -   "name": "NodeCustomError",
+    +   "stackType": "undefined",
+      }
+
+      182 |       `);
+      183 |
+    > 184 |                 expect(result).toMatchObject({
+          |                                ^
+      185 |                     name: "NodeCustomError",
+      186 |                     message: "Node Boom!",
+      187 |                     code: "E_NODE",
+
+      at Object.<anonymous> (test/promise_resolution.spec.ts:184:32)
+
+  ● Promise Resolution Across Boundaries › Error Propagation Across Boundary › Node -> QuickJS (thrown/rejected from injected functions) › should propagate non-Error rejections from Node into QuickJS (object)
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has type:  string
+    Received has value: "[object Object]"
+
+      224 |             `);
+      225 |
+    > 226 |                 expect(result).toMatchObject({
+          |                                ^
+      227 |                     kind: "E_NODE_OBJ",
+      228 |                     message: "bad",
+      229 |                     code: 999,
+
+      at Object.<anonymous> (test/promise_resolution.spec.ts:226:32)
+
+PASS test/quickjs.spec.ts
+
+Test Suites: 1 failed, 2 passed, 3 total
+Tests:       5 failed, 46 passed, 51 total
+Snapshots:   0 total
+Time:        2.179 s
+Ran all test suites.
