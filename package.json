@@ -1,6 +1,6 @@
 {
   "name": "quickjs-vm",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "description": "Run a QuickJS worker from NodeJS",
   "main": "index.js",
   "types": "index.d.ts",
@@ -33,7 +33,8 @@
   "author": "me@scottlott.com",
   "license": "MIT",
   "dependencies": {
-    "cargo-cp-artifact": "^0.1.9"
+    "cargo-cp-artifact": "^0.1.9",
+    "quickjs-emscripten": "^0.31.0"
   },
   "repository": {
     "type": "git",

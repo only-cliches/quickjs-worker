@@ -1,16 +1,17 @@
 use js_data::JsDataTypes;
 use lazy_static::lazy_static;
 use neon::prelude::*;
-use neon::types::Deferred;
+use neon::types::{Deferred, JsDate, JsBuffer, JsNull};
 use quickjs_runtime::values::JsValueFacade;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use serde_json::json;
 
 pub mod qjs;
 pub mod js_data;
-// pub mod handle;
 
 #[derive(Default, Debug)]
 struct NodeConsole {
@@ -22,8 +23,7 @@ struct NodeConsole {
 
 #[derive(Default, Debug)]
 pub struct NodeCallbacks {
-    // require: Option<Root<JsFunction>>,
-    // normalize: Option<Root<JsFunction>>,
+    imports: Option<Root<JsFunction>>,
     console: NodeConsole,
 }
 
@@ -49,6 +49,26 @@ lazy_static! {
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     static ref QJS_HANDLES: Arc<tokio::sync::Mutex<Vec<HashMap<String, JsValueFacade>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
+}
+
+pub enum SyncEvalRequest {
+    Execute {
+        callback_id: usize,
+        args: Vec<JsDataTypes>,
+        resp: oneshot::Sender<Result<JsDataTypes, String>>
+    },
+    Console {
+        level: String,
+        args: Vec<JsDataTypes>,
+        resp: oneshot::Sender<()>
+    },
+    Import {
+        module_name: String,
+        resp: oneshot::Sender<Result<String, String>>
+    },
+    Done {
+        result: Result<(JsDataTypes, cpu_time::ProcessTime, Instant), String>
+    }
 }
 
 pub enum SyncChannelMsg {
@@ -81,7 +101,7 @@ pub enum NodeCallbackTypes {
     Message,
     Close,
 }
-// #[derive(Debug)]
+
 pub enum QuickChannelMsg {
     Quit {
         def: Deferred,
@@ -89,7 +109,19 @@ pub enum QuickChannelMsg {
     SendMessageToQuick {
         message: JsDataTypes,
     },
-    InitGlobals,
+    InitGlobals {
+        structure: String
+    },
+    SetGlobal {
+        key: String,
+        structure: String,
+        def: Deferred
+    },
+    ResolveGlobalPromise {
+        id: u32,
+        result: JsDataTypes,
+        error: Option<String>,
+    },
     NewCallback {
         on: NodeCallbackTypes,
         root: Root<JsFunction>,
@@ -112,28 +144,24 @@ pub enum QuickChannelMsg {
     EvalScript {
         target: ScriptEvalType
     },
-    ResolveGlobalPromise {
-        id: u32,
-        result: JsDataTypes,
-        error: Option<String>,
-    },
 }
 
 pub enum ScriptEvalType {
     Sync { 
         script_name: String,
         source: String,
-        sender: tokio::sync::oneshot::Sender<Result<(JsDataTypes, cpu_time::ProcessTime, Instant), String>>,
+        is_module: bool,
+        sender: tokio::sync::mpsc::Sender<SyncEvalRequest>,
         args: Option<Vec<JsDataTypes>>
     },
     Async { 
         script_name: String,
         source: String,
+        is_module: bool,
         promise: Deferred,
         args: Option<Vec<JsDataTypes>>
     }
 }
-
 
 #[derive(Debug, Default, Clone)]
 pub struct QuickJSOptions {
@@ -143,6 +171,90 @@ pub struct QuickJSOptions {
     gc_interval: Option<u64>,
     max_int: Option<u64>,
     max_eval_time: Option<u64>,
+}
+
+fn process_globals<'a, C: Context<'a>>(
+    cx: &mut C, 
+    obj: Handle<'a, JsObject>, 
+    global_ptrs: &mut Vec<(String, GlobalTypes)>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let keys = obj.get_own_property_names(cx).unwrap_or(JsArray::new(cx, 0));
+    let len = keys.len(cx);
+    
+    for i in 0..len {
+        let key_val: Handle<JsValue> = keys.get(cx, i).unwrap();
+        if let Ok(key_str_obj) = key_val.downcast::<JsString, _>(cx) {
+            let key_str = key_str_obj.value(cx);
+            let val: Handle<JsValue> = obj.get(cx, key_val).unwrap();
+
+            if val.is_a::<JsFunction, _>(cx) {
+                 let func = val.downcast::<JsFunction, _>(cx).unwrap();
+                 let id = global_ptrs.len();
+                 global_ptrs.push((key_str.clone(), GlobalTypes::Function { value: func.root(cx) }));
+                 map.insert(key_str, json!({ "__t": "f", "__i": id }));
+
+            } else if val.is_a::<JsObject, _>(cx) 
+                && !val.is_a::<JsArray, _>(cx) 
+                && !val.is_a::<JsDate, _>(cx) 
+                && !val.is_a::<JsNull, _>(cx) 
+                && !val.is_a::<JsBuffer, _>(cx)
+            {
+                 let sub_obj = val.downcast::<JsObject, _>(cx).unwrap();
+                 let sub_json = process_globals(cx, sub_obj, global_ptrs);
+                 map.insert(key_str, sub_json);
+
+            } else {
+                 let data = JsDataTypes::from_node_value(val, cx).unwrap_or(JsDataTypes::Unknown);
+                 let id = global_ptrs.len();
+                 global_ptrs.push((key_str.clone(), GlobalTypes::Data { value: data }));
+                 map.insert(key_str, json!({ "__t": "d", "__i": id }));
+            }
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+
+fn parse_eval_options<'a>(
+    cx: &mut FunctionContext<'a>, 
+    idx: i32
+) -> (String, bool, Vec<JsDataTypes>) {
+    let mut script_name = String::from("Unnamed Script");
+    let mut is_module = false;
+    let mut args: Vec<JsDataTypes> = Vec::new();
+
+    if let Some(arg) = cx.argument_opt(idx as usize) {
+        if let Ok(obj_arg) = arg.downcast::<JsObject, _>(cx) {
+            // Check for filename/scriptPath
+            if let Ok(val) = obj_arg.get_value(cx, "filename") {
+                 if let Ok(s) = val.downcast::<JsString, _>(cx) {
+                    script_name = s.value(cx);
+                 }
+            }
+            // Check for type: 'module'
+            if let Ok(val) = obj_arg.get_value(cx, "type") {
+                if let Ok(s) = val.downcast::<JsString, _>(cx) {
+                    if s.value(cx) == "module" {
+                        is_module = true;
+                    }
+                }
+            }
+            // Check for args
+            if let Ok(val) = obj_arg.get_value(cx, "args") {
+                if let Ok(arr) = val.downcast::<JsArray, _>(cx) {
+                    let len = arr.len(cx);
+                    for i in 0..len {
+                        let item: Handle<JsValue> = arr.get(cx, i).unwrap();
+                         if let Ok(dt) = JsDataTypes::from_node_value(item, cx) {
+                             args.push(dt);
+                         }
+                    }
+                }
+            }
+        }
+    }
+    (script_name, is_module, args)
 }
 
 fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
@@ -189,35 +301,11 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     if let Some(args_obj) = cx.argument_opt(0) {
         if let Ok(args_obj) = args_obj.downcast::<JsObject, _>(&mut cx) {
 
-            // handle optional "require" callback
-            // if let Ok(value) = args_obj.get_value(&mut cx, "imports") {
-            //     if let Ok(callback) = value.downcast::<JsFunction, _>(&mut cx) {
-            //         NodeCallbacks.require = Some(callback.root(&mut cx));
-            //     }
-            // }
-
-            // handle optional "normalize" callback
-            // if let Ok(value) = args_obj.get_value(&mut cx, "normalize") {
-            //     if let Ok(callback) = value.downcast::<JsFunction, _>(&mut cx) {
-            //         NodeCallbacks.normalize = Some(callback.root(&mut cx));
-            //     }
-            // }
-
-            // if let Ok(value) = args_obj.get_value(&mut cx, "setTimeout") {
-            //     if let Ok(boolean) = value.downcast::<JsBoolean, _>(&mut cx) {
-            //         if boolean.value(&mut cx) {
-            //             Options.enableSetTimeout = true;
-            //         }
-            //     }
-            // }
-
-            // if let Ok(value) = args_obj.get_value(&mut cx, "setImmediate") {
-            //     if let Ok(boolean) = value.downcast::<JsBoolean, _>(&mut cx) {
-            //         if boolean.value(&mut cx) {
-            //             Options.enableSetImmediate = true;
-            //         }
-            //     }
-            // }
+            if let Ok(value) = args_obj.get_value(&mut cx, "imports") {
+                if let Ok(callback) = value.downcast::<JsFunction, _>(&mut cx) {
+                    node_callbacks.imports = Some(callback.root(&mut cx));
+                }
+            }
 
             if let Ok(value) = args_obj.get_value(&mut cx, "maxInterrupt") {
                 if let Ok(value) = value.downcast::<JsNumber, _>(&mut cx) {
@@ -283,33 +371,16 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             if let Ok(value) = args_obj.get_value(&mut cx, "globals") {
                 if let Ok(globals) = value.downcast::<JsObject, _>(&mut cx) {
 
-                    let object_keys = cx
-                    .global::<JsFunction>("Object")?
-                    .get_value(&mut cx, "keys")?
-                    .downcast::<JsFunction, _>(&mut cx).unwrap();
-
-                    let keys = object_keys
-                        .call_with(&mut cx)
-                        .arg(globals)
-                        .apply::<JsArray, _>(&mut cx)?;
-
-                    let mut globals_array = GLOBAL_PTRS.blocking_lock();
-
-                    for i in 0..keys.len(&mut cx) {
-                        let key = keys.get_value(&mut cx, i)?.downcast::<JsString, _>(&mut cx).unwrap().value(&mut cx);
-                        let value = globals.get_value(&mut cx, key.as_str()).unwrap();
-
-                        if let Ok(fn_callback) = value.downcast::<JsFunction, _>(&mut cx) {
-                            globals_array[channel_id].push((key.clone(), GlobalTypes::Function { value: fn_callback.root(&mut cx) }));
-                        } else {
-                            globals_array[channel_id].push((key.clone(), GlobalTypes::Data { value: JsDataTypes::from_node_value(value, &mut cx)? }));
-                        }
-                    }
+                    let mut globals_vec = GLOBAL_PTRS.blocking_lock();
+                    let target_vec = &mut globals_vec[channel_id];
+                    
+                    let structure_json = process_globals(&mut cx, globals, target_vec);
+                    let structure_str = structure_json.to_string();
 
                     let send_fn = &QUICKJS_SENDERS.blocking_lock()[channel_id];
                     send_fn
-                    .blocking_send(QuickChannelMsg::InitGlobals)
-                    .unwrap();
+                        .blocking_send(QuickChannelMsg::InitGlobals { structure: structure_str })
+                        .unwrap();
                 }
             }
         }
@@ -324,7 +395,6 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
     qjs::quickjs_thread(options, channel_id, urx, urx2);
 
-    // create return object for js module
     let return_obj = cx.empty_object();
 
     let is_closed = Arc::new(std::sync::Mutex::new(false));
@@ -458,20 +528,17 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
         let (deferred, promise) = cxf.promise();
 
-        let script_name = if let Some(args_obj) = cxf.argument_opt(1) { 
-            args_obj.downcast_or_throw::<JsString, _>(&mut cxf)?.value(&mut cxf)
-        } else { String::from("Unnamed Script") };
-
-        let mut args: Vec<JsDataTypes> = Vec::new();
-        for i in 0..30 {
-            if let Some(arg_value) = cxf.argument_opt(i + 2) {
-                args.push(JsDataTypes::from_node_value(arg_value, &mut cxf)?);
-            }
-        }
+        let (script_name, is_module, args) = parse_eval_options(&mut cxf, 1);
 
         send_fn
             .blocking_send(QuickChannelMsg::EvalScript {
-                target: ScriptEvalType::Async { promise: deferred, source: String::from(script), script_name, args: if args.len() > 0 { Some(args) } else { None } }
+                target: ScriptEvalType::Async { 
+                    promise: deferred, 
+                    source: String::from(script), 
+                    script_name, 
+                    is_module,
+                    args: if args.len() > 0 { Some(args) } else { None } 
+                }
             })
             .unwrap_or(());
 
@@ -490,29 +557,110 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
 
-        let script_name = if let Some(args_obj) = cxf.argument_opt(1) { 
-            args_obj.downcast_or_throw::<JsString, _>(&mut cxf)?.value(&mut cxf)
-        } else { String::from("./") };
+        let (script_name, is_module, args) = parse_eval_options(&mut cxf, 1);
 
-        let mut args: Vec<JsDataTypes> = Vec::new();
-        for i in 0..30 {
-            if let Some(arg_value) = cxf.argument_opt(i + 2) {
-                args.push(JsDataTypes::from_node_value(arg_value, &mut cxf)?);
-            }
-        }
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         send_fn
             .blocking_send(QuickChannelMsg::EvalScript {
-                target: ScriptEvalType::Sync { sender: tx, script_name, source: String::from(script), args: if args.len() > 0 { Some(args) } else { None } }
+                target: ScriptEvalType::Sync { 
+                    sender: tx, 
+                    script_name, 
+                    source: String::from(script), 
+                    is_module,
+                    args: if args.len() > 0 { Some(args) } else { None } 
+                }
             })
             .unwrap();
 
-        let result = rx.blocking_recv().unwrap();
+        let result = loop {
+            if let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    SyncEvalRequest::Done { result } => break result,
+                    
+                    SyncEvalRequest::Console { level, args, resp } => {
+                         let unlocked_callbacks = NODE_CALLBACKS.blocking_lock();
+                         let callbacks = &unlocked_callbacks[channel_id];
+                         let callback_opt = match level.as_str() {
+                             "log" => &callbacks.console.log,
+                             "warn" => &callbacks.console.warn,
+                             "info" => &callbacks.console.info,
+                             "error" => &callbacks.console.error,
+                             _ => &None,
+                         };
+
+                         if let Some(root_fn) = callback_opt {
+                             let cb_fn = root_fn.to_inner(&mut cxf);
+                             let mut fn_handle = cb_fn.call_with(&mut cxf);
+                             
+                             for arg in args.iter() {
+                                 if let Ok(node_val) = arg.to_node_value(&mut cxf) {
+                                     fn_handle.arg(node_val);
+                                 } else {
+                                     fn_handle.arg(cxf.undefined());
+                                 }
+                             }
+                             let _ = fn_handle.apply::<JsValue, _>(&mut cxf);
+                         }
+                         let _ = resp.send(());
+                    },
+                    
+                    SyncEvalRequest::Import { module_name, resp } => {
+                         let unlocked_callbacks = NODE_CALLBACKS.blocking_lock();
+                         let callbacks = &unlocked_callbacks[channel_id];
+                         
+                         if let Some(import_fn) = &callbacks.imports {
+                             let cb_fn = import_fn.to_inner(&mut cxf);
+                             let mut fn_handle = cb_fn.call_with(&mut cxf);
+                             fn_handle.arg(cxf.string(module_name));
+                             
+                             match fn_handle.apply::<JsValue, _>(&mut cxf) {
+                                 Ok(val) => {
+                                     if let Ok(str_val) = val.downcast::<JsString, _>(&mut cxf) {
+                                         let _ = resp.send(Ok(str_val.value(&mut cxf)));
+                                     } else {
+                                         let _ = resp.send(Err("Import callback must return a string".to_string()));
+                                     }
+                                 },
+                                 Err(_) => {
+                                     let _ = resp.send(Err("Import callback threw an error".to_string()));
+                                 }
+                             }
+                         } else {
+                             let _ = resp.send(Err("No import callback defined".to_string()));
+                         }
+                    },
+
+                    SyncEvalRequest::Execute { callback_id, args, resp } => {
+                        let globals = GLOBAL_PTRS.blocking_lock();
+                        let (_, value) = &globals[channel_id][callback_id];
+                        
+                        let execution_result = match value {
+                            GlobalTypes::Function { value } => {
+                                let mut fn_handle = value.to_inner(&mut cxf).call_with(&mut cxf);
+                                for arg in args.iter() {
+                                    if let Ok(node_val) = arg.to_node_value(&mut cxf) {
+                                        fn_handle.arg(node_val);
+                                    } else {
+                                        fn_handle.arg(cxf.undefined());
+                                    }
+                                }
+                                match fn_handle.apply::<JsValue, _>(&mut cxf) {
+                                    Ok(res) => JsDataTypes::from_node_value(res, &mut cxf).map_err(|_e| "Conversion error".to_string()),
+                                    Err(_) => Err("Execution Error".to_string())
+                                }
+                            },
+                            GlobalTypes::Data { value } => Ok(value.clone())
+                        };
+                        let _ = resp.send(execution_result);
+                    }
+                }
+            } else {
+                break Err("Channel closed unexpectedly".to_string());
+            }
+        };
 
         match result {
             Ok((data, cpu_time, start_time)) => {
-
                 let return_value = cxf.empty_array();
                 let stats = cxf.empty_object();
                 let int_counters = INT_COUNTERS.blocking_lock();
@@ -541,6 +689,36 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     .unwrap();
 
     return_obj.set(&mut cx, "evalSync", eval_sync_fn).unwrap();
+
+    let closed_clone = is_closed.clone();
+    let set_global = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+        if *closed_clone.lock().unwrap() == true {
+            return cxf.throw_error("Runtime is closed");
+        }
+
+        let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
+        let key = cxf.argument::<JsString>(0)?.value(&mut cxf);
+        let val_obj = cxf.argument::<JsObject>(1)?;
+        let (deferred, promise) = cxf.promise();
+
+        // Use process_globals recursively on this new object
+        let mut globals_vec = GLOBAL_PTRS.blocking_lock();
+        let target_vec = &mut globals_vec[channel_id];
+        let structure_json = process_globals(&mut cxf, val_obj, target_vec);
+        let structure_str = structure_json.to_string();
+
+        send_fn
+            .blocking_send(QuickChannelMsg::SetGlobal {
+                key,
+                structure: structure_str,
+                def: deferred
+            })
+            .unwrap();
+
+        return Ok(promise);
+    }).unwrap();
+
+    return_obj.set(&mut cx, "setGlobal", set_global).unwrap();
 
     let closed_clone = is_closed.clone();
     let to_byte_code = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
@@ -602,86 +780,11 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     return_obj
         .set(&mut cx, "loadByteCode", to_byte_code)?;
 
-    // Handle Object
-    // let handle_obj = JsObject::new(&mut cx);
-
-    // let eval_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-
-    // })?;
-
-    // handle::create_handle(&mut cxf, channel_id, handle::HandleType::Eval);
-
-    // handle_obj.set(&mut cx, "eval", eval_fn)?;
-
-    // let eval_fn_sync = JsFunction::new(&mut cx, |mut cxf: FunctionContext| {
-
-    //     handle::create_handle(&mut cxf, channel_id, handle::HandleType::EvalSync)
-    // })?;
-
-    // handle_obj.set(&mut cx, "evalSync", eval_fn_sync)?;
-
-    // let closed_clone = is_closed.clone();
-    // let create_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
-    //     if *closed_clone.lock().unwrap() == true {
-    //         return cxf.throw_error("Runtime is closed");
-    //     }
-
-    //     let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
-    //     let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
-
-    //     let script_name = String::from("qjs-worker: create_handle.js");
-
-    //     let (tx, rx) = tokio::sync::oneshot::channel();
-    //     send_fn
-    //         .blocking_send(QuickChannelMsg::EvalScript {
-    //             target: ScriptEvalType::Sync { sender: tx, script_name, source: String::from(script), args: None }
-    //         })
-    //         .unwrap();
-
-    //     let result = rx.blocking_recv().unwrap();
-
-    //     match result {
-    //         Ok((data, cpu_time, start_time)) => {
-
-    //             let return_value = cxf.empty_array();
-    //             let stats = cxf.empty_object();
-    //             let int_counters = INT_COUNTERS.blocking_lock();
-
-    //             let out = data.to_node_value(&mut cxf)?;
-                
-    //             let interrupt_count = if int_counters[channel_id].0 > 0 {
-    //                 cxf.number(int_counters[channel_id].1 as f64)
-    //             } else {
-    //                 cxf.number(-1)
-    //             };
-    //             let total_cpu = cpu_time.elapsed().as_nanos();
-    //             let eval_time =
-    //                 cxf.number(start_time.elapsed().as_nanos() as f64 / (1000f64 * 1000f64));
-    //             let total_cpu = cxf.number(total_cpu as f64 / (1000f64 * 1000f64));
-    //             stats.set(&mut cxf, "interrupts", interrupt_count)?;
-    //             stats.set(&mut cxf, "evalTimeMs", eval_time)?;
-    //             stats.set(&mut cxf, "cpuTimeMs", total_cpu)?;
-    //             return_value.set(&mut cxf, 1, stats)?;
-    //             return_value.set(&mut cxf, 0, out)?;
-    //             Ok(return_value)
-    //         },
-    //         Err(e) => cxf.throw_error(e)
-    //     }
-        
-    // }).unwrap();
-    // handle_obj.set(&mut cx, "create", create_fn)?;
-
-    // return_obj
-    // .set(&mut cx, "handle", handle_obj)
-    // .unwrap();
-
-
     Ok(return_obj)
 }
 
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("QJSWorker", create_worker)?;
-
     Ok(())
 }
