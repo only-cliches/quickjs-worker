@@ -1,0 +1,39 @@
+{
+  "compilerOptions": {
+    /* Language and Environment */
+    "target": "ES2021",                          /* Set the JavaScript language version for emitted JavaScript and include compatible library declarations. */
+    "lib": ["ES2021"],                           /* Specify a set of bundled library declaration files that describe the target runtime environment. */
+    "module": "commonjs",                        /* Specify what module code is generated. */
+    "moduleResolution": "node",                  /* Specify how TypeScript looks up a file from a given module specifier. */
+    
+    /* JavaScript Support */
+    "allowJs": true,                             /* Allow JavaScript files to be a part of your program. Use the 'checkJs' option to get errors from these files. */
+    "checkJs": false,                            /* Disable error reporting in JS files to avoid linting your existing index.js too strictly during tests. */
+
+    /* Interop Constraints */
+    "esModuleInterop": true,                     /* Emit additional JavaScript to ease support for importing CommonJS modules. This enables 'import ... from ...' syntax. */
+    "forceConsistentCasingInFileNames": true,    /* Ensure that casing is correct in imports. */
+    "resolveJsonModule": true,                   /* Enable importing .json files. */
+
+    /* Type Checking */
+    "strict": true,                              /* Enable all strict type-checking options. */
+    "noImplicitAny": false,                      /* Disable error reporting for expressions and declarations with an implied 'any' type (useful when importing untyped JS files). */
+    "skipLibCheck": true,                        /* Skip type checking all .d.ts files. */
+
+    /* Emit */
+    "outDir": "./dist",                          /* Specify an output folder for all emitted files. */
+    "sourceMap": true,                           /* Create source map files for emitted JavaScript files. */
+    "declaration": true,                         /* Generate .d.ts files from TypeScript and JavaScript files in your project. */
+
+    /* Types */
+    "types": ["node", "jest"]                    /* Include type definitions for Node.js and Jest globally. */
+  },
+  "include": [
+    "index.js",
+    "test/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}

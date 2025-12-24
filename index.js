@@ -13,11 +13,27 @@ class QuickJS extends EventEmitter {
         this.lastExecutionStats = null;
     }
 
+    /**
+     * Helper to keep the Node.js event loop alive while waiting for the 
+     * unref'd native worker to complete a task.
+     */
+    async _wrapNative(task) {
+        // Create a no-op interval to act as a "ref" for the event loop
+        const keepAlive = setInterval(() => {}, 1000 * 60 * 60);
+        try {
+            return await task();
+        } finally {
+            clearInterval(keepAlive);
+        }
+    }
+
     async eval(code, options = {}) {
-        const opts = this._normalizeOptions(options);
-        const [result, stats] = await this._native.eval(code, opts);
-        this.lastExecutionStats = stats;
-        return result;
+        return this._wrapNative(async () => {
+            const opts = this._normalizeOptions(options);
+            const [result, stats] = await this._native.eval(code, opts);
+            this.lastExecutionStats = stats;
+            return result;
+        });
     }
 
     evalSync(code, options = {}) {
@@ -28,15 +44,17 @@ class QuickJS extends EventEmitter {
     }
 
     async evalModule(code, options = {}) {
-        const opts = this._normalizeOptions(options);
-        opts.type = 'module';
-        const [result, stats] = await this._native.eval(code, opts);
-        this.lastExecutionStats = stats;
-        return result;
+        return this._wrapNative(async () => {
+            const opts = this._normalizeOptions(options);
+            opts.type = 'module';
+            const [result, stats] = await this._native.eval(code, opts);
+            this.lastExecutionStats = stats;
+            return result;
+        });
     }
 
     async setGlobal(key, value) {
-        return this._native.setGlobal(key, value);
+        return this._wrapNative(() => this._native.setGlobal(key, value));
     }
     
     postMessage(msg) {
@@ -44,23 +62,29 @@ class QuickJS extends EventEmitter {
     }
 
     async getByteCode(code) {
-        return this._native.getByteCode(code);
+        return this._wrapNative(() => this._native.getByteCode(code));
     }
 
     async loadByteCode(bytes) {
-        return this._native.loadByteCode(bytes);
+        return this._wrapNative(() => this._native.loadByteCode(bytes));
     }
 
     async gc() {
-        return this._native.gc();
+        return this._wrapNative(() => this._native.gc());
     }
 
     async memory() {
-        return this._native.memory();
+        return this._wrapNative(() => this._native.memory());
     }
 
     async close() {
-        return this._native.close();
+        if (this.isClosed()) return;
+        
+        // 1. Call the native close (which sends Quit, drops Channel, resolves Promise)
+        await this._wrapNative(() => this._native.close());
+        
+        // 2. Yield to the event loop to allow handle cleanup
+        await new Promise(resolve => setTimeout(resolve, 10));
     }
 
     isClosed() {

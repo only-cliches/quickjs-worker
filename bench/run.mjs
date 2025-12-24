@@ -9,13 +9,9 @@ async function main() {
     console.log("=== quickjs-vm ===\n");
     const runtime = new QuickJS({
         console: console,
-        globals: {
-            // pass through fs
-            fs: fs
-        }
     });
-    const evalResult = await runtime.eval(benchScript);
-    await runtime.close();
+    await runtime.eval(benchScript);
+    // await runtime.close();
 
     console.log("\n\n=== quickjs-emscripten ===\n");
     const qjs = await getQuickJS();
