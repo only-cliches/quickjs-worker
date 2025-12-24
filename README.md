@@ -8,28 +8,28 @@ This results in **significantly higher performance**, lower overhead, and true s
 
 ## 🚀 Features
 
-* **⚡️ High Performance**: Runs directly on the host CPU without WASM interpretation overhead.
-* **🔄 Async & Sync Evaluation**: Strict `evalSync` for blocking operations and `eval` (Promise-based) for async workflows.
-* **📦 ES Modules Support**: Full support for `import` / `export` syntax with custom module resolution handlers.
-* **🛡 Sandboxing & Limits**:
+**⚡️ High Performance**: Runs directly on the host CPU without WASM interpretation overhead.  
+**🔄 Async & Sync Evaluation**: Strict `evalSync` for blocking operations and `eval` (Promise-based) for async workflows.  
+**📦 ES Modules Support**: Full support for `import` / `export` syntax with custom module resolution handlers.  
+**🛡 Sandboxing & Limits**:  
 * **Timeouts**: `maxEvalMs` to kill infinite loops.
 * **Memory Limits**: `maxMemoryBytes` to prevent OOM crashes.
 * **Stack Limits**: Control recursion depth.
 
 
-* **💾 Data Serialization**: Seamless round-trip data passing for:
+**💾 Data Serialization**: Seamless round-trip data passing for:
 * Primitives (`string`, `number`, `boolean`, `null`, `undefined`)
 * Complex Types (`Date`, `Buffer` / `Uint8Array`, JSON Objects)
 * Functions (pass Node.js functions into QuickJS)
 
 
-* **📞 Inter-Process Communication**:
+**📞 Inter-Process Communication**:
 * `postMessage` API for bidirectional messaging between Node and the QuickJS worker.
 * Event-based architecture (`on('message')`, `on('close')`).
 
 
-* **⚙️ Bytecode**: Pre-compile JavaScript to bytecode (`getByteCode`) and execute it later (`loadByteCode`) for faster startup times.
-* **🧹 Lifecycle Management**:
+**⚙️ Bytecode**: Pre-compile JavaScript to bytecode (`getByteCode`) and execute it later (`loadByteCode`) for faster startup times.  
+**🧹 Lifecycle Management**:  
 * Explicit `close()` to release native resources.
 * `gc()` to force garbage collection.
 * `memory()` inspection.
