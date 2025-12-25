@@ -1847,7 +1847,7 @@ function am4(i,x,w,j,c,n) {
 // IE7 does 9% better with am3/28 than with am4/26.
 // Firefox (SM) gets 10% faster with am3/28 than with am4/26.
 
-setupEngine = function(fn, bits) {
+var setupEngine = function(fn, bits) {
   BigInteger.prototype.am = fn;
   dbits = bits;
 
@@ -3368,14 +3368,14 @@ RSAKey.prototype.decrypt = RSADecrypt;
 //RSAKey.prototype.b64_decrypt = RSAB64Decrypt;
 
 
-nValue="a5261939975948bb7a58dffe5ff54e65f0498f9175f5a09288810b8975871e99af3b5dd94057b0fc07535f5f97444504fa35169d461d0d30cf0192e307727c065168c788771c561a9400fb49175e9e6aa4e23fe11af69e9412dd23b0cb6684c4c2429bce139e848ab26d0829073351f4acd36074eafd036a5eb83359d2a698d3";
-eValue="10001";
-dValue="8e9912f6d3645894e8d38cb58c0db81ff516cf4c7e5a14c7f1eddb1459d2cded4d8d293fc97aee6aefb861859c8b6a3d1dfe710463e1f9ddc72048c09751971c4a580aa51eb523357a3cc48d31cfad1d4a165066ed92d4748fb6571211da5cb14bc11b6e2df7c1a559e6d5ac1cd5c94703a22891464fba23d0d965086277a161";
-pValue="d090ce58a92c75233a6486cb0a9209bf3583b64f540c76f5294bb97d285eed33aec220bde14b2417951178ac152ceab6da7090905b478195498b352048f15e7d";
-qValue="cab575dc652bb66df15a0359609d51d1db184750c00c6698b90ef3465c99655103edbf0d54c56aec0ce3c4d22592338092a126a0cc49f65a4a30d222b411e58f";
-dmp1Value="1a24bca8e273df2f0e47c199bbf678604e7df7215480c77c8db39f49b000ce2cf7500038acfff5433b7d582a01f1826e6f4d42e1c57f5e1fef7b12aabc59fd25";
-dmq1Value="3d06982efbbe47339e1f6d36b1216b8a741d410b0c662f54f7118b27b9a4ec9d914337eb39841d8666f3034408cf94f5b62f11c402fc994fe15a05493150d9fd";
-coeffValue="3a3e731acd8960b7ff9eb81a7ff93bd1cfa74cbd56987db58b4594fb09c09084db1734c8143f98b602b981aaa9243ca28deb69b5b280ee8dcee0fd2625e53250";
+var nValue="a5261939975948bb7a58dffe5ff54e65f0498f9175f5a09288810b8975871e99af3b5dd94057b0fc07535f5f97444504fa35169d461d0d30cf0192e307727c065168c788771c561a9400fb49175e9e6aa4e23fe11af69e9412dd23b0cb6684c4c2429bce139e848ab26d0829073351f4acd36074eafd036a5eb83359d2a698d3";
+var eValue="10001";
+var dValue="8e9912f6d3645894e8d38cb58c0db81ff516cf4c7e5a14c7f1eddb1459d2cded4d8d293fc97aee6aefb861859c8b6a3d1dfe710463e1f9ddc72048c09751971c4a580aa51eb523357a3cc48d31cfad1d4a165066ed92d4748fb6571211da5cb14bc11b6e2df7c1a559e6d5ac1cd5c94703a22891464fba23d0d965086277a161";
+var pValue="d090ce58a92c75233a6486cb0a9209bf3583b64f540c76f5294bb97d285eed33aec220bde14b2417951178ac152ceab6da7090905b478195498b352048f15e7d";
+var qValue="cab575dc652bb66df15a0359609d51d1db184750c00c6698b90ef3465c99655103edbf0d54c56aec0ce3c4d22592338092a126a0cc49f65a4a30d222b411e58f";
+var dmp1Value="1a24bca8e273df2f0e47c199bbf678604e7df7215480c77c8db39f49b000ce2cf7500038acfff5433b7d582a01f1826e6f4d42e1c57f5e1fef7b12aabc59fd25";
+var dmq1Value="3d06982efbbe47339e1f6d36b1216b8a741d410b0c662f54f7118b27b9a4ec9d914337eb39841d8666f3034408cf94f5b62f11c402fc994fe15a05493150d9fd";
+var coeffValue="3a3e731acd8960b7ff9eb81a7ff93bd1cfa74cbd56987db58b4594fb09c09084db1734c8143f98b602b981aaa9243ca28deb69b5b280ee8dcee0fd2625e53250";
 
 setupEngine(am3, 28);
 
@@ -5383,91 +5383,91 @@ function sc_Char(c) {
 sc_Char.lazy = new Object();
 // thanks to Eric
 sc_Char.char2readable = {
-    "\000": "#\\null",
-    "\007": "#\\bell",
-    "\010": "#\\backspace",
-    "\011": "#\\tab",
-    "\012": "#\\newline",
-    "\014": "#\\page",
-    "\015": "#\\return",
-    "\033": "#\\escape",
-    "\040": "#\\space",
-    "\177": "#\\delete",
+    "0x000": "#\\null",
+    "0x007": "#\\bell",
+    "0x010": "#\\backspace",
+    "0x011": "#\\tab",
+    "0x012": "#\\newline",
+    "0x014": "#\\page",
+    "0x015": "#\\return",
+    "0x033": "#\\escape",
+    "0x040": "#\\space",
+    "0x177": "#\\delete",
 
   /* poeticless names */
-    "\001": "#\\soh",
-    "\002": "#\\stx",
-    "\003": "#\\etx",
-    "\004": "#\\eot",
-    "\005": "#\\enq",
-    "\006": "#\\ack",
+    "0x001": "#\\soh",
+    "0x002": "#\\stx",
+    "0x003": "#\\etx",
+    "0x004": "#\\eot",
+    "0x005": "#\\enq",
+    "0x006": "#\\ack",
 
-    "\013": "#\\vt",
-    "\016": "#\\so",
-    "\017": "#\\si",
+    "0x013": "#\\vt",
+    "0x016": "#\\so",
+    "0x017": "#\\si",
 
-    "\020": "#\\dle",
-    "\021": "#\\dc1",
-    "\022": "#\\dc2",
-    "\023": "#\\dc3",
-    "\024": "#\\dc4",
-    "\025": "#\\nak",
-    "\026": "#\\syn",
-    "\027": "#\\etb",
+    "0x020": "#\\dle",
+    "0x021": "#\\dc1",
+    "0x022": "#\\dc2",
+    "0x023": "#\\dc3",
+    "0x024": "#\\dc4",
+    "0x025": "#\\nak",
+    "0x026": "#\\syn",
+    "0x027": "#\\etb",
 
-    "\030": "#\\can",
-    "\031": "#\\em",
-    "\032": "#\\sub",
-    "\033": "#\\esc",
-    "\034": "#\\fs",
-    "\035": "#\\gs",
-    "\036": "#\\rs",
-    "\037": "#\\us"};
+    "0x030": "#\\can",
+    "0x031": "#\\em",
+    "0x032": "#\\sub",
+    "0x033": "#\\esc",
+    "0x034": "#\\fs",
+    "0x035": "#\\gs",
+    "0x036": "#\\rs",
+    "0x037": "#\\us"};
 
 sc_Char.readable2char = {
-    "null": "\000",
-    "bell": "\007",
-    "backspace": "\010",
-    "tab": "\011",
-    "newline": "\012",
-    "page": "\014",
-    "return": "\015",
-    "escape": "\033",
-    "space": "\040",
-    "delete": "\000",
-    "soh": "\001",
-    "stx": "\002",
-    "etx": "\003",
-    "eot": "\004",
-    "enq": "\005",
-    "ack": "\006",
-    "bel": "\007",
-    "bs": "\010",
-    "ht": "\011",
-    "nl": "\012",
-    "vt": "\013",
-    "np": "\014",
-    "cr": "\015",
-    "so": "\016",
-    "si": "\017",
-    "dle": "\020",
-    "dc1": "\021",
-    "dc2": "\022",
-    "dc3": "\023",
-    "dc4": "\024",
-    "nak": "\025",
-    "syn": "\026",
-    "etb": "\027",
-    "can": "\030",
-    "em": "\031",
-    "sub": "\032",
-    "esc": "\033",
-    "fs": "\034",
-    "gs": "\035",
-    "rs": "\036",
-    "us": "\037",
-    "sp": "\040",
-    "del": "\177"};
+    "null": "0x000",
+    "bell": "0x007",
+    "backspace": "0x010",
+    "tab": "0x011",
+    "newline": "0x012",
+    "page": "0x014",
+    "return": "0x015",
+    "escape": "0x033",
+    "space": "0x040",
+    "delete": "0x000",
+    "soh": "0x001",
+    "stx": "0x002",
+    "etx": "0x003",
+    "eot": "0x004",
+    "enq": "0x005",
+    "ack": "0x006",
+    "bel": "0x007",
+    "bs": "0x010",
+    "ht": "0x011",
+    "nl": "0x012",
+    "vt": "0x013",
+    "np": "0x014",
+    "cr": "0x015",
+    "so": "0x016",
+    "si": "0x017",
+    "dle": "0x020",
+    "dc1": "0x021",
+    "dc2": "0x022",
+    "dc3": "0x023",
+    "dc4": "0x024",
+    "nak": "0x025",
+    "syn": "0x026",
+    "etb": "0x027",
+    "can": "0x030",
+    "em": "0x031",
+    "sub": "0x032",
+    "esc": "0x033",
+    "fs": "0x034",
+    "gs": "0x035",
+    "rs": "0x036",
+    "us": "0x037",
+    "sp": "0x040",
+    "del": "0x177"};
 
 sc_Char.prototype.toString = function() {
     return this.val;
@@ -8978,6 +8978,7 @@ SC_DEFAULT_OUT = new sc_GenericOutputPort(function(s) {});
 SC_ERROR_OUT = SC_DEFAULT_OUT;
 
 function RunBenchmark(name, count, run, warn) {
+  var result;
   for (var n = 0; n < count; ++n) {
     result = run();
     if (!warn(result)) {

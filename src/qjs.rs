@@ -15,8 +15,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 use crate::{
-    EvalOutcome, GlobalTypes, JsDataTypes, NodeCallbackTypes, QuickChannelMsg, QuickJSOptions, ScriptEvalType,
-    SyncChannelMsg, INT_COUNTERS, NODE_CALLBACKS, NODE_CHANNELS, QUICKJS_CALLBACKS, SYNC_SENDERS,
+    EvalOutcome, GlobalTypes, JsDataTypes, NodeCallbackTypes, QuickChannelMsg, QuickJSOptions,
+    ScriptEvalType, SyncChannelMsg, INT_COUNTERS, NODE_CALLBACKS, NODE_CHANNELS, QUICKJS_CALLBACKS,
+    SYNC_SENDERS,
 };
 
 lazy_static::lazy_static! {
@@ -269,28 +270,72 @@ async fn facade_to_jsdatatypes(
             // ---- Error extraction (native) ----
             if quick_val.is_error() {
                 // best-effort: message + stack (if available)
-                let message = quick_val.to_string().unwrap_or_else(|_| "Error".into());
+                let message = realm
+                    .get_object_property(&quick_val, "message")
+                    .ok()
+                    .and_then(|m| {
+                        if m.is_string() {
+                            m.to_string().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "Error".into());
 
                 let stack = if quick_val.is_object() {
-                    realm.get_object_property(&quick_val, "stack")
+                    realm
+                        .get_object_property(&quick_val, "stack")
                         .ok()
-                        .and_then(|s| if s.is_string() { s.to_string().ok() } else { None })
+                        .and_then(|s| {
+                            if s.is_string() {
+                                s.to_string().ok()
+                            } else {
+                                None
+                            }
+                        })
                 } else {
                     None
                 };
 
                 let name = if quick_val.is_object() {
-                    realm.get_object_property(&quick_val, "name")
+                    realm
+                        .get_object_property(&quick_val, "name")
                         .ok()
-                        .and_then(|n| if n.is_string() { n.to_string().ok() } else { None })
+                        .and_then(|n| {
+                            if n.is_string() {
+                                n.to_string().ok()
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_else(|| "Error".into())
                 } else {
                     "Error".into()
                 };
 
-                return Err(JsDataTypes::Error { name, message, stack });
-            }
+                // ADDED: Extract 'code' if present
+                let code = if quick_val.is_object() {
+                    realm
+                        .get_object_property(&quick_val, "code")
+                        .ok()
+                        .and_then(|n| {
+                            if n.is_string() {
+                                n.to_string().ok()
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                };
 
+                return Ok(JsDataTypes::Error {
+                    name,
+                    message,
+                    stack,
+                    code,
+                });
+            }
 
             // Normal value conversion
             let v = JsDataTypes::from_quick_value(&quick_val, realm).unwrap();
@@ -319,7 +364,6 @@ impl QuickJSWorker {
         Ok(a)
     }
 
-
     pub async fn process_script_eval(
         realm_id: String,
         start_time: Instant,
@@ -331,7 +375,14 @@ impl QuickJSWorker {
         let mut max_time_ms = max_eval_time.unwrap_or(0);
 
         match script_result {
-            Err(err) => return Err(JsDataTypes::Error { name: "Error".into(), message: err.to_string(), stack: None }),
+            Err(err) => {
+                return Err(JsDataTypes::Error {
+                    name: "Error".into(),
+                    message: err.to_string(),
+                    stack: None,
+                    code: None,
+                })
+            }
             Ok(mut val) => {
                 // --- PROMISE RESOLUTION LOGIC ---
                 if val.is_js_promise() {
@@ -349,7 +400,14 @@ impl QuickJSWorker {
                                 .await
                                 {
                                     Ok(r) => r,
-                                    Err(e) => return Err(JsDataTypes::Error { name: "TimeoutError".into(), message: e.to_string(), stack: None }),
+                                    Err(e) => {
+                                        return Err(JsDataTypes::Error {
+                                            name: "TimeoutError".into(),
+                                            message: e.to_string(),
+                                            stack: None,
+                                            code: None,
+                                        })
+                                    }
                                 }
                             } else {
                                 promise_future.await
@@ -374,7 +432,12 @@ impl QuickJSWorker {
                                 }
                                 // Internal Runtime Error
                                 Err(e) => {
-                                    return Err(JsDataTypes::Error { name: "Error".into(), message: e.to_string(), stack: None });
+                                    return Err(JsDataTypes::Error {
+                                        name: "Error".into(),
+                                        message: e.to_string(),
+                                        stack: None,
+                                        code: None,
+                                    });
                                 }
                             }
                         }
@@ -414,7 +477,7 @@ impl QuickJSWorker {
 
 
                         if quick_val.is_promise() {
-                            return Err(JsDataTypes::Error { name: "Error".into(), message: "Script returned a Promise that could not be awaited. (Likely a top-level Promise.reject)".to_string(), stack: None });
+                            return Err(JsDataTypes::Error { name: "Error".into(), message: "Script returned a Promise that could not be awaited. (Likely a top-level Promise.reject)".to_string(), stack: None, code: None });
                         }
 
                         // 2. Check for Error Objects (Native Check)
@@ -436,7 +499,12 @@ impl QuickJSWorker {
                                 .ok()
                                 .and_then(|s| if s.is_string() { s.to_string().ok() } else { None });
 
-                            return Err(JsDataTypes::Error { name, message, stack });
+                            let code = realm
+                                .get_object_property(&quick_val, "code")
+                                .ok()
+                                .and_then(|c| if c.is_string() { c.to_string().ok() } else { None });
+
+                            return Err(JsDataTypes::Error { name, message, stack, code });
                         }
 
                         // 3. Check for Error Objects (Duck Typing)
@@ -446,7 +514,11 @@ impl QuickJSWorker {
                             if let (Ok(m), Ok(s)) = (has_msg, has_stack) {
                                 if !m.is_undefined() && !s.is_undefined() {
                                     let msg_str = m.to_string().unwrap_or("Error".into());
-                                    return Err(JsDataTypes::Error { name: "Error".into(), message: msg_str, stack: None });
+                                    // code extraction for duck-typed error
+                                    let code = realm.get_object_property(&quick_val, "code")
+                                        .ok().and_then(|c| if c.is_string() { c.to_string().ok() } else { None });
+                                    
+                                    return Err(JsDataTypes::Error { name: "Error".into(), message: msg_str, stack: None, code });
                                 }
                             }
                         }
@@ -591,73 +663,81 @@ pub fn quickjs_thread(
                         }
                     }
                     SyncChannelMsg::SendError { e, def } => {
-                            
-                            let unlocked = NODE_CHANNELS.blocking_lock();
-                            let channel = &unlocked[channel_id];
-                            if let Some(channel) = channel {
-                                channel
-                                    .send(move |mut cx| {
-                                        // If this is our structured Error payload, materialize a real JS Error.
-                                        let js_val: Handle<JsValue> = match &e {
-                                            JsDataTypes::Error { name, message, stack } => {
-                                                let js_err = cx.error(message.as_str())?;
-                                                let obj = js_err.upcast::<JsObject>();
+                        let unlocked = NODE_CHANNELS.blocking_lock();
+                        let channel = &unlocked[channel_id];
+                        if let Some(channel) = channel {
+                            channel
+                                .send(move |mut cx| {
+                                    let js_val: Handle<JsValue> = match &e {
+                                        JsDataTypes::Error {
+                                            name,
+                                            message,
+                                            stack,
+                                            code,
+                                        } => {
+                                            let err_instance = cx.error(message.as_str())?;
 
-                                                let name_val = cx.string(name.as_str());
-                                                obj.set(&mut cx, "name", name_val)?;
-                                                if let Some(stack) = stack {
-                                                    let stack_val = cx.string(stack.as_str());
-                                                    obj.set(&mut cx, "stack", stack_val)?;
-                                                }
+                                            let name_val = cx.string(name.as_str());
+                                            err_instance.set(&mut cx, "name", name_val)?;
 
-                                                obj.as_value(&mut cx)
+                                            if let Some(stack) = stack {
+                                                let stack_val = cx.string(stack.as_str());
+                                                err_instance.set(&mut cx, "stack", stack_val)?;
                                             }
+                                            if let Some(code) = code {
+                                                let code_val = cx.string(code.as_str());
+                                                err_instance.set(&mut cx, "code", code_val)?;
+                                            }
+                                            err_instance.upcast::<JsValue>()
+                                        }
+                                        JsDataTypes::Json { msg } => {
+                                            if let Ok(v) =
+                                                serde_json::from_str::<serde_json::Value>(msg)
+                                            {
+                                                let is_err = v
+                                                    .get("__quickjs_vm_type")
+                                                    .and_then(|t| t.as_str())
+                                                    .map(|t| t == "Error")
+                                                    .unwrap_or(false);
 
-                                            JsDataTypes::Json { msg } => {
-                                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) {
-                                                    let is_err = v
-                                                        .get("__quickjs_vm_type")
-                                                        .and_then(|t| t.as_str())
-                                                        .map(|t| t == "Error")
-                                                        .unwrap_or(false);
+                                                if is_err {
+                                                    let name = v
+                                                        .get("name")
+                                                        .and_then(|n| n.as_str())
+                                                        .unwrap_or("Error");
+                                                    let message = v
+                                                        .get("message")
+                                                        .and_then(|m| m.as_str())
+                                                        .unwrap_or("Error");
+                                                    let stack =
+                                                        v.get("stack").and_then(|s| s.as_str());
 
-                                                    if is_err {
-                                                        let name = v
-                                                            .get("name")
-                                                            .and_then(|n| n.as_str())
-                                                            .unwrap_or("Error");
-                                                        let message = v
-                                                            .get("message")
-                                                            .and_then(|m| m.as_str())
-                                                            .unwrap_or("Error");
-                                                        let stack = v.get("stack").and_then(|s| s.as_str());
-
-                                                        let err = cx.error(message)?;
-                                                        let obj = err.upcast::<JsObject>();
-                                                        let obj_val = cx.string(name);
-                                                        obj.set(&mut cx, "name", obj_val)?;
-                                                        if let Some(stack) = stack {
-                                                            let stack_val = cx.string(stack);
-                                                            obj.set(&mut cx, "stack", stack_val)?;
-                                                        }
-                                                        obj.as_value(&mut cx)
-                                                    } else {
-                                                        e.to_node_value(&mut cx)?
+                                                    let err = cx.error(message)?;
+                                                    let obj = err.upcast::<JsObject>();
+                                                    let obj_val = cx.string(name);
+                                                    obj.set(&mut cx, "name", obj_val)?;
+                                                    if let Some(stack) = stack {
+                                                        let stack_val = cx.string(stack);
+                                                        obj.set(&mut cx, "stack", stack_val)?;
                                                     }
+                                                    obj.as_value(&mut cx)
                                                 } else {
                                                     e.to_node_value(&mut cx)?
                                                 }
+                                            } else {
+                                                e.to_node_value(&mut cx)?
                                             }
-                                            _ => e.to_node_value(&mut cx)?,
-                                        };
+                                        }
+                                        _ => e.to_node_value(&mut cx)?,
+                                    };
 
-                                        def.reject(&mut cx, js_val);
-                                        Ok(())
-                                    })
-                                    .join()
-                                    .unwrap();
-                            }
+                                    def.reject(&mut cx, js_val);
+                                    Ok(())
+                                })
+                                .join()
+                                .unwrap();
                         }
+                    }
                     SyncChannelMsg::SendMessageToNode { message } => {
                         let cbs = msg_cb_clone.clone();
                         let unlocked = NODE_CHANNELS.blocking_lock();
@@ -746,7 +826,9 @@ pub fn quickjs_thread(
                         if let Some(channel) = &unlocked[channel_id] {
                             channel.send(move |mut cx| {
                                 {
-                                    let unlocked_cbs = cbs.try_lock().unwrap();
+                                    // FIX: Use blocking_lock() instead of try_lock().unwrap()
+                                    // This prevents panics during high-concurrency worker churn.
+                                    let unlocked_cbs = cbs.blocking_lock();
                                     for cbb in unlocked_cbs.iter() {
                                         if cbb.1 == NodeCallbackTypes::Close {
                                             let _ = cbb
@@ -835,8 +917,12 @@ pub fn quickjs_thread(
                                     Ok(EvalOutcome::Rejected(err_val)) => {
                                         // Preserve Error details if present; otherwise throw a generic ExecutionError.
                                         match err_val {
-                                            JsDataTypes::Error { name, message, stack } => {
-                                                return realm.create_error(name.as_str(), message.as_str(), stack.as_deref().unwrap_or(""));
+                                            JsDataTypes::Error { name, message, stack, code } => {
+                                                let err = realm.create_error(name.as_str(), message.as_str(), stack.as_deref().unwrap_or(""))?;
+                                                if let Some(c) = code {
+                                                    let _ = realm.set_object_property(&err, "code", &realm.create_string(c.as_str())?)?;
+                                                }
+                                                return Ok(err);
                                             }
                                             other => {
                                                 return realm.create_error("ExecutionError", other.to_string().as_str(), "");
@@ -884,8 +970,9 @@ pub fn quickjs_thread(
                                                     let qs_error = quick_sender.clone();
                                                     let error_func = JsFunction::new(&mut cx, move |mut cx| {
                                                         let val = cx.argument::<JsValue>(0)?;
-                                                        let err_msg = val.to_string(&mut cx)?.value(&mut cx);
-                                                        qs_error.blocking_send(QuickChannelMsg::ResolveGlobalPromise { id: req_id, result: JsDataTypes::Undefined, error: Some(err_msg) }).ok();
+                                                        // FIX: Capture rejection value properly as JsDataTypes
+                                                        let err_data = JsDataTypes::from_node_value(val, &mut cx).unwrap_or(JsDataTypes::Unknown);
+                                                        qs_error.blocking_send(QuickChannelMsg::ResolveGlobalPromise { id: req_id, result: JsDataTypes::Undefined, error: Some(err_data) }).ok();
                                                         Ok(cx.undefined())
                                                     })?;
                                                     let args: Vec<Handle<JsValue>> = vec![success_func.upcast(), error_func.upcast()];
@@ -933,7 +1020,6 @@ pub fn quickjs_thread(
                             let init_script = runtime.loop_async(move |_runtime| {
                                 let structure_json: serde_json::Value = serde_json::from_str(&structure).unwrap();
                                 let mut generated_code = String::new();
-                                // FIX: Initialize the root object variable first
                                 generated_code.push_str(&format!("if (typeof {0} === 'undefined') var {0} = {{}};\n", key));
                                 
                                 if let Some(obj) = structure_json.as_object() {
@@ -999,7 +1085,6 @@ pub fn quickjs_thread(
                                     let eval_result = if is_module_eval {
                                         realm.eval_module(use_script)
                                     } else {
-                                        // FIX: Removed 'None' argument here (Realm Adapter eval)
                                         realm.eval(use_script)
                                     };
                                     match eval_result {
@@ -1013,7 +1098,6 @@ pub fn quickjs_thread(
                                         Err(e) => return Err(e),
                                     }
                                 } else {
-                                    // FIX: Removed 'None' argument here (Realm Adapter eval)
                                     match realm.eval(Script::new(".", "undefined")) {
                                         Ok(eval_result) => { return realm.to_js_value_facade(&eval_result); }
                                         Err(e) => return Err(e),
@@ -1032,8 +1116,8 @@ pub fn quickjs_thread(
                                             map.remove(&channel_id);
                                         }
                                         match target {
-                                            ScriptEvalType::Sync { sender, .. } => { sender.send(crate::SyncEvalRequest::Done { result: (EvalOutcome::Rejected(JsDataTypes::Error { name: "Error".into(), message: e.to_string(), stack: None }), start_cpu, start_time) }).await.unwrap_or(()); },
-                                            ScriptEvalType::Async { promise, .. }  => { let sync_channel = SYNC_SENDERS.lock().await; sync_channel[channel_id].send(SyncChannelMsg::SendError { e: JsDataTypes::Error { name: "Error".into(), message: e.to_string(), stack: None }, def: promise }).await.unwrap(); }
+                                            ScriptEvalType::Sync { sender, .. } => { sender.send(crate::SyncEvalRequest::Done { result: (EvalOutcome::Rejected(JsDataTypes::Error { name: "Error".into(), message: e.to_string(), stack: None, code: None }), start_cpu, start_time) }).await.unwrap_or(()); },
+                                            ScriptEvalType::Async { promise, .. }  => { let sync_channel = SYNC_SENDERS.lock().await; sync_channel[channel_id].send(SyncChannelMsg::SendError { e: JsDataTypes::Error { name: "Error".into(), message: e.to_string(), stack: None, code: None }, def: promise }).await.unwrap(); }
                                         }
                                         return;
                                     }
@@ -1117,9 +1201,11 @@ pub fn quickjs_thread(
                                 if let Some((res, rej)) = resolvers.remove(&id) {
                                     let res_handle = realm.from_js_value_facade(res)?;
                                     let rej_handle = realm.from_js_value_facade(rej)?;
-                                    if let Some(err_msg) = error {
-                                        let err_val = realm.create_string(&err_msg)?;
-                                        realm.invoke_function(None, &rej_handle, &[&err_val])?;
+                                    
+                                    // FIX: Correctly convert the JsDataTypes error back to a QuickJS value
+                                    if let Some(err_val) = error {
+                                        let q_err = err_val.to_quick_value(realm)?;
+                                        realm.invoke_function(None, &rej_handle, &[&q_err])?;
                                     } else {
                                         let val = result.to_quick_value(realm)?;
                                         realm.invoke_function(None, &res_handle, &[&val])?;

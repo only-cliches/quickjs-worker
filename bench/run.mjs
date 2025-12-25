@@ -6,7 +6,10 @@ const benchScript = fs.readFileSync("./bench/v8-bench.js").toString();
 
 async function main() {
 
-    console.log("=== quickjs-vm ===\n");
+    console.log("=== node-js ===\n");
+    eval(benchScript);
+    
+    console.log("\n\n=== quickjs-vm ===\n");
     const runtime = new QuickJS({
         console: console,
     });

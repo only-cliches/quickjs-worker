@@ -38,6 +38,8 @@ pub enum JsDataTypes {
         name: String,
         message: String,
         stack: Option<String>,
+        // ADDED: Support for 'code' property to fix "Node -> QuickJS" test failure
+        code: Option<String>,
     },
 }
 
@@ -67,6 +69,7 @@ impl ToString for JsDataTypes {
                 name: _,
                 message: _,
                 stack: _,
+                code: _,
             } => String::from("[object Error]"),
         }
     }
@@ -95,6 +98,7 @@ impl JsDataTypes {
                 name,
                 message,
                 stack,
+                code,
             } => {
                 let err_ctor = realm.get_object_property(&realm.get_global()?, "Error")?;
                 let msg_v = realm.create_string(message)?;
@@ -104,6 +108,10 @@ impl JsDataTypes {
                 if let Some(stack) = stack {
                     let _ =
                         realm.set_object_property(&err_obj, "stack", &realm.create_string(stack)?);
+                }
+                // ADDED: Set code if present
+                if let Some(c) = code {
+                    let _ = realm.set_object_property(&err_obj, "code", &realm.create_string(c)?);
                 }
                 Ok(err_obj)
             }
@@ -149,11 +157,19 @@ impl JsDataTypes {
                     None
                 };
 
+                // ADDED: Extract code property
+                let code_val = realm.get_object_property(value, "code")?;
+                let code = if code_val.is_string() {
+                    Some(code_val.to_string()?)
+                } else {
+                    None
+                };
 
                 Ok(JsDataTypes::Error {
                     name: name,
                     message: message.unwrap_or_default(),
                     stack,
+                    code,
                 })
             }
             quickjs_runtime::jsutils::JsValueType::Object => {
@@ -234,11 +250,14 @@ impl JsDataTypes {
                 name,
                 message,
                 stack,
+                code,
             } => {
+                // NOTE: This to_node_value is used for general object conversion.
+                // For PROMISE REJECTIONS (SendError), we handle it in lib.rs to ensure prototype chain correctness.
+                // However, if this is used elsewhere, we should still return a valid Error.
                 let js_err = cxf.error(message.as_str())?;
                 let obj = js_err.upcast::<JsObject>();
 
-                // Create handles first (each borrows &mut cx), then use them.
                 let name_key = cxf.string("name");
                 let name_val = cxf.string(name.as_str());
                 obj.set(cxf, name_key, name_val)?;
@@ -247,6 +266,12 @@ impl JsDataTypes {
                     let stack_key = cxf.string("stack");
                     let stack_val = cxf.string(stack.as_str());
                     obj.set(cxf, stack_key, stack_val)?;
+                }
+
+                if let Some(code_val) = code {
+                    let code_key = cxf.string("code");
+                    let c_val = cxf.string(code_val.as_str());
+                    obj.set(cxf, code_key, c_val)?;
                 }
 
                 Ok(obj.as_value(cxf))
@@ -319,10 +344,18 @@ impl JsDataTypes {
                 .and_then(|st| st.downcast::<JsString, _>(cxf).ok())
                 .map(|s| s.value(cxf));
 
+            // ADDED: Extract code property
+            let code = error
+                .get_value(cxf, "code")
+                .ok()
+                .and_then(|c| c.downcast::<JsString, _>(cxf).ok())
+                .map(|s| s.value(cxf));
+
             return Ok(JsDataTypes::Error {
                 name: name.unwrap_or_else(|| "Error".to_string()),
                 message: message.unwrap_or_default(),
                 stack,
+                code,
             });
         }
 

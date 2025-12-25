@@ -1,4 +1,4 @@
-import { QuickJS } from '../index'; 
+import { QuickJS } from '../index';
 import { EventEmitter } from 'events';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -11,10 +11,49 @@ describe('QuickJS Integration Tests', () => {
             await qjs.close();
         }
     });
-    
+
+    it('should stabilize memory usage after churn', async () => {
+        const initialMemory = process.memoryUsage().rss;
+
+        // Churn through 500 workers
+        for (let i = 0; i < 500; i++) {
+            const qjs = new QuickJS();
+            await qjs.eval('1+1');
+            await qjs.close();
+        }
+
+        // Force GC if possible (requires --expose-gc) or allow for some overhead
+        global.gc && global.gc();
+
+        const finalMemory = process.memoryUsage().rss;
+        const growth = (finalMemory - initialMemory) / 1024 / 1024; // MB
+
+        // Expect growth to be less than 50MB (adjust based on your baseline overhead)
+        expect(growth).toBeLessThan(50);
+    }, 30000);
+
+    describe('Invariant: Worker Isolation', () => {
+        it('should never share state between workers', async () => {
+            const workerA = new QuickJS();
+            const workerB = new QuickJS();
+
+            await workerA.setGlobal('sharedKey', 'VALUE_A');
+            await workerB.setGlobal('sharedKey', 'VALUE_B');
+
+            const valA = await workerA.eval('sharedKey');
+            const valB = await workerB.eval('sharedKey');
+
+            expect(valA).toBe('VALUE_A');
+            expect(valB).toBe('VALUE_B');
+
+            await workerA.close();
+            await workerB.close();
+        });
+    });
+
     // ... [Previous Instantiation / Basic Evaluation / Synchronous / Module / Globals tests remain same] ...
     describe('Instantiation', () => {
-        
+
         it('should instantiate without errors', () => {
             qjs = new QuickJS();
             expect(qjs).toBeInstanceOf(QuickJS);
@@ -57,7 +96,7 @@ describe('QuickJS Integration Tests', () => {
         it('should respect timeout limits', async () => {
             await qjs.close();
             qjs = new QuickJS({ maxEvalMs: 100 });
-            
+
             await expect(qjs.eval('while(true) {}')).rejects.toBeDefined();
         });
 
@@ -100,7 +139,7 @@ describe('QuickJS Integration Tests', () => {
             const result = await qjs.evalModule(code);
             expect(result).toBe(20);
         });
-        
+
         it('should handle imports if a loader is configured', async () => {
             qjs = new QuickJS({
                 imports: (path: string) => {
@@ -210,11 +249,11 @@ describe('QuickJS Integration Tests', () => {
             expect(bytecode).toBeInstanceOf(Uint8Array);
             expect(bytecode.length).toBeGreaterThan(0);
             await qjs.loadByteCode(bytecode);
-            
+
             const funcSource = 'globalThis.myFunc = () => 42;';
             const funcBytecode = await qjs.getByteCode(funcSource);
             await qjs.loadByteCode(funcBytecode);
-            
+
             const result = await qjs.eval('myFunc()');
             expect(result).toBe(42);
         });

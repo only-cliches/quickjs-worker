@@ -40,6 +40,7 @@ Safe, seamless data exchange between Node and QuickJS:
 - Primitives (`string`, `number`, `boolean`, `null`, `undefined`)
 - Structured data (Objects, Arrays, JSON)
 - `Date`
+- `Error`
 - `Buffer` / `Uint8Array`
 - Functions (call Node functions from QuickJS)
 
@@ -91,7 +92,7 @@ Benchmarks were run using the **V8 Benchmark Suite (v7)** comparing:
 
 ## 📦 Installation
 
-```bash
+```sh
 npm install quickjs-vm
 ````
 
@@ -101,8 +102,8 @@ npm install quickjs-vm
 
 ### Basic Evaluation
 
-```js
-const { QuickJS } = require('quickjs-vm');
+```ts
+import { QuickJS } from 'quickjs-vm';
 
 const vm = new QuickJS();
 

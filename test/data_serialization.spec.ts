@@ -1,4 +1,5 @@
-import { QuickJS } from '../index'; 
+import { QuickJS } from '../index';
+import fc from 'fast-check';
 
 describe('Data Serialization & Eval Arguments', () => {
     let qjs: QuickJS;
@@ -11,6 +12,24 @@ describe('Data Serialization & Eval Arguments', () => {
         if (qjs && !qjs.isClosed()) {
             await qjs.close();
         }
+    });
+
+
+    describe('Invariant: Data Round-trip', () => {
+        let qjs: QuickJS;
+
+        beforeAll(() => { qjs = new QuickJS(); });
+        afterAll(async () => await qjs.close());
+
+        it('should preserve value identity for all JSON-serializable data', async () => {
+            await fc.assert(
+                fc.asyncProperty(fc.jsonValue(), async (data) => {
+                    const result = await qjs.eval('(x) => x', { args: [data] });
+                    expect(result).toEqual(data);
+                }),
+                { numRuns: 100 }
+            );
+        });
     });
 
     describe('Round Trip Data Serialization', () => {
@@ -27,7 +46,7 @@ describe('Data Serialization & Eval Arguments', () => {
             const inputFloat = 3.14159;
             const resInt = await qjs.eval(identityScript, { args: [inputInt] });
             const resFloat = await qjs.eval(identityScript, { args: [inputFloat] });
-            
+
             expect(resInt).toBe(inputInt);
             expect(resFloat).toBe(inputFloat);
         });
@@ -54,11 +73,11 @@ describe('Data Serialization & Eval Arguments', () => {
         });
 
         it('should serialize JSON Objects correctly', async () => {
-            const input = { 
-                foo: "bar", 
-                nested: { 
-                    val: 123 
-                } 
+            const input = {
+                foo: "bar",
+                nested: {
+                    val: 123
+                }
             };
             const result = await qjs.eval(identityScript, { args: [input] });
             expect(result).toEqual(input);
@@ -67,7 +86,7 @@ describe('Data Serialization & Eval Arguments', () => {
         it('should serialize Dates correctly', async () => {
             const input = new Date("2023-01-01T12:00:00Z");
             const result = await qjs.eval(identityScript, { args: [input] });
-            
+
             // NOTE: Passed as a direct argument, the native bridge preserves the Date type.
             // We use Duck Typing check because cross-context instances can confuse 'instanceof'
             expect(result).not.toBeNull();
@@ -79,28 +98,28 @@ describe('Data Serialization & Eval Arguments', () => {
         it('should serialize Buffers (Uint8Array) correctly', async () => {
             const input = Buffer.from([0x01, 0x02, 0xff]);
             const result = await qjs.eval(identityScript, { args: [input] });
-            
+
             expect(Buffer.isBuffer(result) || result instanceof Uint8Array).toBe(true);
             expect(Buffer.compare(input, result as Buffer)).toBe(0);
         });
-        
+
         it('should handle complex mixed structures (via JSON serialization)', async () => {
             const input = {
                 a: [1, 2],
                 b: "string",
-                c: new Date(1000), 
+                c: new Date(1000),
                 d: Buffer.from([10])
             };
             const result = await qjs.eval(identityScript, { args: [input] });
-            
+
             expect(result.a).toEqual([1, 2]);
             expect(result.b).toBe("string");
-            
+
             // NOTE: Nested objects are currently serialized via JSON.stringify/parse.
             // Dates become ISO strings, and Buffers/Uint8Arrays become standard JSON objects/arrays.
             expect(typeof result.c).toBe('string');
             expect(result.c).toBe(input.c.toISOString());
-            
+
             // Buffers inside objects serialize to JSON object structure { type: 'Buffer', data: [...] } or regular arrays depending on Node version behavior with JSON.stringify
             expect(result.d).toBeDefined();
         });
@@ -110,9 +129,9 @@ describe('Data Serialization & Eval Arguments', () => {
         it('should pass multiple arguments in correct order', async () => {
             const script = '(a, b, c) => [a, b, c]';
             const args = [1, "second", true];
-            
+
             const result = await qjs.eval(script, { args });
-            
+
             expect(result).toHaveLength(3);
             expect(result[0]).toBe(1);
             expect(result[1]).toBe("second");
@@ -134,9 +153,9 @@ describe('Data Serialization & Eval Arguments', () => {
         it('should allow arguments to be modified inside QuickJS without affecting Node original', async () => {
             const inputObj = { val: 1 };
             const script = '(obj) => { obj.val = 999; return obj; }';
-            
+
             const result = await qjs.eval(script, { args: [inputObj] });
-            
+
             // Result from QJS should have new value
             expect(result.val).toBe(999);
             // Original Node object should remain untouched (serialization copies data)

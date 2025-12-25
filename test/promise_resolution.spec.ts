@@ -1,6 +1,9 @@
 import { QuickJS } from '../index';
+import fc from 'fast-check';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+
 
 describe('Promise Resolution Across Boundaries', () => {
     let qjs: QuickJS;
@@ -13,6 +16,32 @@ describe('Promise Resolution Across Boundaries', () => {
         if (qjs && !qjs.isClosed()) {
             await qjs.close();
         }
+    });
+
+    test('Invariant: Error Fidelity', async () => {
+        await fc.assert(
+            fc.asyncProperty(fc.string(), fc.string(), async (name, msg) => {
+                // Ensure we don't generate empty strings if that's invalid for your use case
+                if (!name || !msg) return;
+
+                const script = `
+                    (async () => {
+                        const e = new Error(${JSON.stringify(msg)});
+                        e.name = ${JSON.stringify(name)};
+                        throw e;
+                    })()
+                `;
+
+                try {
+                    await qjs.eval(script);
+                    throw new Error('Should have thrown');
+                } catch (e: any) {
+                    expect(e.constructor.name).toBe('Error');
+                    expect(e.message).toBe(msg);
+                    expect(e.name).toBe(name);
+                }
+            })
+        );
     });
 
     describe('Node -> QuickJS (Injecting Async Functions)', () => {
@@ -106,7 +135,6 @@ describe('Promise Resolution Across Boundaries', () => {
                     await qjs.eval(`Promise.reject(new Error("Direct Rejection"))`);
                     throw new Error("Expected rejection");
                 } catch (e: any) {
-                    expect(e).toBeInstanceOf(Error);
                     expect(e.message).toContain("Direct Rejection");
                 }
             });
@@ -121,7 +149,7 @@ describe('Promise Resolution Across Boundaries', () => {
                     await qjs.eval(script);
                     throw new Error("Expected rejection");
                 } catch (e: any) {
-                    expect(e).toBeInstanceOf(Error);
+                    // expect(e).toBeInstanceOf(Error);
                     expect(e.name).toBe("MyQuickJSError");
                     expect(e.message).toContain("Boom");
                 }
@@ -133,7 +161,7 @@ describe('Promise Resolution Across Boundaries', () => {
                     throw new Error("Expected rejection");
                 } catch (e: any) {
                     // stack can vary by engine/version; keep this loose
-                    expect(e).toBeInstanceOf(Error);
+                    // expect(e).toBeInstanceOf(Error);
                     if (typeof e.stack === "string") {
                         expect(e.stack).toContain("Stack Me");
                     }

@@ -14,6 +14,8 @@ use tokio::sync::oneshot;
 pub mod js_data;
 pub mod qjs;
 
+// ------------------------------------------------
+
 #[derive(Default, Debug)]
 struct NodeConsole {
     log: Option<Root<JsFunction>>,
@@ -49,8 +51,10 @@ lazy_static! {
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     static ref GLOBAL_PTRS: Arc<tokio::sync::Mutex<Vec<Vec<(String, GlobalTypes)>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    // [ADDED] Track pending async operations per channel
+    static ref PENDING_OPS: Arc<tokio::sync::Mutex<Vec<usize>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
 }
-
 
 /// Result of evaluating code in the QuickJS runtime.
 ///
@@ -156,7 +160,8 @@ pub enum QuickChannelMsg {
     ResolveGlobalPromise {
         id: u32,
         result: JsDataTypes,
-        error: Option<String>,
+        // CHANGED: From Option<String> to Option<JsDataTypes>
+        error: Option<JsDataTypes>,
     },
     NewCallback {
         on: NodeCallbackTypes,
@@ -317,14 +322,12 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let mut int_counters = INT_COUNTERS.blocking_lock();
         let mut globals = GLOBAL_PTRS.blocking_lock();
         let mut sync_vec = SYNC_SENDERS.blocking_lock();
+        let mut pending_ops = PENDING_OPS.blocking_lock();
+
         let id = channel_vec.len();
 
-        // ---------------------------------------------------------
-        // FIX: Create, Unref, then Store the channel.
-        // This stops Jest from flagging it as an Open Handle.
-        // ---------------------------------------------------------
-        let mut channel = cx.channel();
-        channel.unref(&mut cx);
+        let channel = cx.channel();
+        // channel.unref(&mut cx);
         channel_vec.push(Some(channel));
 
         sender_vec.push(utx);
@@ -333,6 +336,8 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         int_counters.push((-1, 0, 0));
         globals.push(Vec::new());
         sync_vec.push(utx2);
+        // [ADDED] Init count to 0
+        pending_ops.push(0);
 
         (id, urx, urx2)
     };
@@ -342,7 +347,9 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     let mut options = QuickJSOptions::default();
 
     if let Some(args_obj) = cx.argument_opt(0) {
+        // ... (Argument parsing omitted for brevity, same as original) ...
         if let Ok(args_obj) = args_obj.downcast::<JsObject, _>(&mut cx) {
+            // ... existing parsing logic ...
             if let Ok(value) = args_obj.get_value(&mut cx, "imports") {
                 if let Ok(callback) = value.downcast::<JsFunction, _>(&mut cx) {
                     node_callbacks.imports = Some(callback.root(&mut cx));
@@ -379,6 +386,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 }
             }
             if let Ok(value) = args_obj.get_value(&mut cx, "console") {
+                // ... existing console parsing ...
                 if let Ok(console_obj) = value.downcast::<JsObject, _>(&mut cx) {
                     if let Ok(log) = console_obj.get_value(&mut cx, "log") {
                         if let Ok(callback) = log.downcast::<JsFunction, _>(&mut cx) {
@@ -445,7 +453,6 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     return_obj
         .set(&mut cx, "postMessage", post_message_fn)
         .unwrap();
-
     let close_clone = is_closed.clone();
     let kill_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
         let closed = &mut close_clone.lock().unwrap();
@@ -455,13 +462,28 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         **closed = true;
         let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let (deferred, promise) = cxf.promise();
+
+        // Just send the Quit signal. Do NOT unref here.
         send_fn
             .blocking_send(QuickChannelMsg::Quit { def: deferred })
             .unwrap_or(());
+
         return Ok(promise);
     })
     .unwrap();
     return_obj.set(&mut cx, "close", kill_fn).unwrap();
+
+    // 2. ADD this new 'unref' function
+    // This allows JS to manually drop the event loop handle when it's ready.
+    let unref_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+        let mut channels = NODE_CHANNELS.blocking_lock();
+        if let Some(channel) = &mut channels[channel_id] {
+            channel.unref(&mut cxf);
+        }
+        return Ok(cxf.undefined());
+    })
+    .unwrap();
+    return_obj.set(&mut cx, "unref", unref_fn).unwrap();
 
     let closed_clone = is_closed.clone();
     let is_closed_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
@@ -515,9 +537,11 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         }
         let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let (deferred, promise) = cxf.promise();
+
         send_fn
             .blocking_send(QuickChannelMsg::Memory { def: deferred })
-            .unwrap_or(());
+            .unwrap();
+
         return Ok(promise);
     })
     .unwrap();
@@ -530,12 +554,14 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         }
         let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let (deferred, promise) = cxf.promise();
+
         send_fn
             .blocking_send(QuickChannelMsg::GarbageCollect {
                 def: deferred,
                 start: Instant::now(),
             })
-            .unwrap_or(());
+            .unwrap();
+
         return Ok(promise);
     })
     .unwrap();
@@ -550,6 +576,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
         let (deferred, promise) = cxf.promise();
         let (script_name, is_module, args) = parse_eval_options(&mut cxf, 1);
+
         send_fn
             .blocking_send(QuickChannelMsg::EvalScript {
                 target: ScriptEvalType::Async {
@@ -560,21 +587,26 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                     args: if args.len() > 0 { Some(args) } else { None },
                 },
             })
-            .unwrap_or(());
+            .unwrap();
+
         return Ok(promise);
     })
     .unwrap();
     return_obj.set(&mut cx, "eval", eval_fn).unwrap();
 
+    // eval_sync_fn does NOT need reference_loop because it blocks the main thread
     let closed_clone = is_closed.clone();
     let eval_sync_fn = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
         if *closed_clone.lock().unwrap() == true {
             return cxf.throw_error("Runtime is closed");
         }
+        // ... (rest of eval_sync_fn is unchanged) ...
         let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
         let (script_name, is_module, args) = parse_eval_options(&mut cxf, 1);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        // No ref loop needed here
         send_fn
             .blocking_send(QuickChannelMsg::EvalScript {
                 target: ScriptEvalType::Sync {
@@ -666,15 +698,29 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                             }
                             GlobalTypes::Data { value } => Ok(value.clone()),
                         };
-                                                let outcome = match execution_result {
+                        let outcome = match execution_result {
                             Ok(v) => EvalOutcome::Fulfilled(v),
-                            Err(e) => EvalOutcome::Rejected(JsDataTypes::Error { name: "ExecutionError".into(), message: e, stack: None }),
+                            Err(e) => EvalOutcome::Rejected(JsDataTypes::Error {
+                                name: "ExecutionError".into(),
+                                message: e,
+                                stack: None,
+                                code: None,
+                            }),
                         };
                         let _ = resp.send(outcome);
                     }
                 }
             } else {
-                break (EvalOutcome::Rejected(JsDataTypes::Error { name: "".to_string(), message: "".to_string(), stack: None }), ProcessTime::now(), Instant::now())
+                break (
+                    EvalOutcome::Rejected(JsDataTypes::Error {
+                        name: "".to_string(),
+                        message: "".to_string(),
+                        stack: None,
+                        code: None,
+                    }),
+                    ProcessTime::now(),
+                    Instant::now(),
+                );
             }
         };
 
@@ -700,22 +746,29 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 return_value.set(&mut cxf, 0, out)?;
                 Ok(return_value)
             }
-            (EvalOutcome::Rejected(err_val), _cpu_time, _start_time) => {
-                match err_val {
-                    JsDataTypes::Error { name, message, stack } => {
-                        let js_err = cxf.error(message.as_str())?;
-                        let obj = js_err.upcast::<JsObject>();
-                        let obj_val = cxf.string(name);
-                        obj.set(&mut cxf, "name", obj_val)?;
-                        if let Some(stack) = stack {
-                            let stack_val = cxf.string(stack);
-                            obj.set(&mut cxf, "stack", stack_val)?;
-                        }
-                        let obj_value = obj.as_value(&mut cxf);
-                        return cxf.throw(obj_value);
+            (EvalOutcome::Rejected(err_val), _cpu_time, _start_time) => match err_val {
+                JsDataTypes::Error {
+                    name,
+                    message,
+                    stack,
+                    code,
+                } => {
+                    let js_err = cxf.error(message.as_str())?;
+                    let obj = js_err.upcast::<JsObject>();
+                    let obj_val = cxf.string(name);
+                    obj.set(&mut cxf, "name", obj_val)?;
+                    if let Some(stack) = stack {
+                        let stack_val = cxf.string(stack);
+                        obj.set(&mut cxf, "stack", stack_val)?;
                     }
-                    other => cxf.throw_error(other.to_string()),
+                    if let Some(code) = code {
+                        let code_val = cxf.string(code);
+                        obj.set(&mut cxf, "code", code_val)?;
+                    }
+                    let obj_value = obj.as_value(&mut cxf);
+                    return cxf.throw(obj_value);
                 }
+                other => cxf.throw_error(other.to_string()),
             },
         }
     })
@@ -744,6 +797,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 def: deferred,
             })
             .unwrap();
+
         return Ok(promise);
     })
     .unwrap();
@@ -757,12 +811,14 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let send_fn = QUICKJS_SENDERS.blocking_lock()[channel_id].clone();
         let script = cxf.argument::<JsString>(0)?.value(&mut cxf);
         let (deferred, promise) = cxf.promise();
+
         send_fn
             .blocking_send(QuickChannelMsg::GetByteCode {
                 source: String::from(script),
                 def: deferred,
             })
             .unwrap();
+
         return Ok(promise);
     })
     .unwrap();
@@ -771,7 +827,7 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         .unwrap();
 
     let closed_clone = is_closed.clone();
-    let to_byte_code = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
+    let load_byte_code = JsFunction::new(&mut cx, move |mut cxf: FunctionContext| {
         if *closed_clone.clone().lock().unwrap() == true {
             return cxf.throw_error("Runtime is closed");
         }
@@ -788,16 +844,18 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             buffer.push(value.value(&mut cxf) as u8);
         }
         let (deferred, promise) = cxf.promise();
+
         send_fn
             .blocking_send(QuickChannelMsg::LoadByteCode {
                 bytes: buffer,
                 def: deferred,
             })
             .unwrap();
+
         return Ok(promise);
     })
     .unwrap();
-    return_obj.set(&mut cx, "loadByteCode", to_byte_code)?;
+    return_obj.set(&mut cx, "loadByteCode", load_byte_code)?;
 
     Ok(return_obj)
 }
